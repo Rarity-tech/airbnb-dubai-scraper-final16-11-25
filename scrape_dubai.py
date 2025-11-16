@@ -171,6 +171,8 @@ def search_zone_with_retry(zone):
         sw_lat=zone["sw_lat"],
         sw_long=zone["sw_long"],
         zoom_value=ZOOM_VALUE,
+        price_min=0,
+        price_max=0,
         currency=CURRENCY,
     )
 
