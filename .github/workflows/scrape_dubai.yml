@@ -21,9 +21,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scraper
+      - name: Run pyrbnb debug
         run: |
-          python scrape_dubai.py
+          python debug_pyrbnb.py
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
