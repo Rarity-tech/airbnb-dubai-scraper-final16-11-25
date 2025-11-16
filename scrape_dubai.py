@@ -11,7 +11,7 @@ import pyairbnb
 # Configuration
 # =============================================================================
 
-LISTINGS_PER_RUN = int(os.getenv("LISTINGS_PER_RUN", "200"))
+LISTINGS_PER_RUN = int(os.getenv("LISTINGS_PER_RUN", "50"))
 OUTPUT_CSV = "dubai_listings.csv"
 
 # Dates: environ 2 semaines dans le futur, séjour de 5 nuits
