@@ -1,13 +1,13 @@
 # scrape_dubai.py
 
-from pyairbnb import Client
+from pyairbnb.client import PyAirbnb
 import csv
 import time
 
 def search_dubai_listings():
-    client = Client()
+    client = PyAirbnb()
     all_results = []
-    max_pages = 3  # Limite pour éviter les surcharges
+    max_pages = 3
     current_page = 0
 
     while current_page < max_pages:
@@ -19,7 +19,7 @@ def search_dubai_listings():
             min_price=300,
             max_price=3000,
             allow_flexible_dates=False,
-            items_per_page=50,  # ← paramètre valide
+            items_per_page=50,
             source="structured_search_input_header"
         )
 
@@ -34,7 +34,7 @@ def search_dubai_listings():
             break
 
         current_page += 1
-        time.sleep(2)  # Petite pause pour éviter de spammer l’API
+        time.sleep(2)
 
     return all_results
 
@@ -43,7 +43,8 @@ def extract_listing_info(listings):
 
     for listing in listings:
         data = listing.get("listing", {})
-        host = listing.get("listing", {}).get("primary_host", {})
+        host = data.get("primary_host", {})
+        pricing = listing.get("pricing_quote", {}).get("rate", {})
 
         extracted.append({
             "id": data.get("id"),
@@ -52,7 +53,7 @@ def extract_listing_info(listings):
             "room_type": data.get("room_type_category"),
             "bedrooms": data.get("bedrooms"),
             "bathrooms": data.get("bathrooms"),
-            "price_per_night": listing.get("pricing_quote", {}).get("rate", {}).get("amount"),
+            "price_per_night": pricing.get("amount"),
             "monthly_price_factor": listing.get("pricing_quote", {}).get("monthly_price_factor"),
             "weekly_price_factor": listing.get("pricing_quote", {}).get("weekly_price_factor"),
             "is_superhost": host.get("is_superhost"),
