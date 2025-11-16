@@ -1,95 +1,225 @@
-# scrape_dubai.py
-
-from pyairbnb.client import PyAirbnb
 import csv
-import time
+from datetime import date, timedelta
 
-def search_dubai_listings():
-    client = PyAirbnb()
-    all_results = []
-    max_pages = 3
-    current_page = 0
+# On importe UNIQUEMENT ce que le module pyairbnb expose dans __all__
+from pyairbnb import search_all, get_details
 
-    while current_page < max_pages:
-        response = client.search_all(
-            location="Dubai, United Arab Emirates",
-            items_per_grid=50,
-            min_bathrooms=1,
-            min_bedrooms=1,
-            min_price=300,
-            max_price=3000,
-            allow_flexible_dates=False,
-            items_per_page=50,
-            source="structured_search_input_header"
-        )
 
-        if not response or "results" not in response:
-            print("❌ Aucun résultat reçu ou structure inattendue.")
-            break
+# =========================
+# CONFIGURATION GÉNÉRALE
+# =========================
 
-        all_results.extend(response["results"])
-        print(f"✔️ Page {current_page + 1} : {len(response['results'])} annonces récupérées.")
+# Décalage dans le futur pour les dates (pour que la recherche soit valide)
+CHECK_IN_OFFSET_DAYS = 30
+STAY_NIGHTS = 3
 
-        if not response.get("has_next_page", False):
-            break
+# Taille de l'échantillon pour les tests (tu pourras augmenter plus tard)
+SAMPLE_SIZE = 40
 
-        current_page += 1
-        time.sleep(2)
+# Devise et langue utilisées par la lib pyairbnb
+CURRENCY = "USD"
+LANGUAGE = "en"
 
-    return all_results
+# Bounding box approximative pour Dubaï (NE = nord-est, SW = sud-ouest)
+NE_LAT = 25.35
+NE_LON = 55.50
+SW_LAT = 25.00
+SW_LON = 55.15
 
-def extract_listing_info(listings):
-    extracted = []
-
-    for listing in listings:
-        data = listing.get("listing", {})
-        host = data.get("primary_host", {})
-        pricing = listing.get("pricing_quote", {}).get("rate", {})
-
-        extracted.append({
-            "id": data.get("id"),
-            "name": data.get("name"),
-            "property_type": data.get("property_type"),
-            "room_type": data.get("room_type_category"),
-            "bedrooms": data.get("bedrooms"),
-            "bathrooms": data.get("bathrooms"),
-            "price_per_night": pricing.get("amount"),
-            "monthly_price_factor": listing.get("pricing_quote", {}).get("monthly_price_factor"),
-            "weekly_price_factor": listing.get("pricing_quote", {}).get("weekly_price_factor"),
-            "is_superhost": host.get("is_superhost"),
-            "license_code": data.get("license"),
-            "latitude": data.get("lat"),
-            "longitude": data.get("lng"),
-            "reviews_count": data.get("reviews_count"),
-            "star_rating": data.get("star_rating"),
-            "city": data.get("city"),
-            "neighborhood": data.get("localized_neighborhood"),
-        })
-
-    return extracted
-
-def save_to_csv(data, filename="dubai_airbnb_listings.csv"):
-    if not data:
-        print("❌ Aucune donnée à enregistrer.")
-        return
-
-    with open(filename, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=data[0].keys())
-        writer.writeheader()
-        writer.writerows(data)
-
-    print(f"✅ Données enregistrées dans : {filename}")
 
 def main():
-    print("--- Phase 1 : Recherche des annonces ---")
-    results = search_dubai_listings()
-    print(f"Total d'annonces trouvées : {len(results)}")
+    # =========================
+    # 1. Préparer les dates
+    # =========================
+    today = date.today()
+    check_in = (today + timedelta(days=CHECK_IN_OFFSET_DAYS)).strftime("%Y-%m-%d")
+    check_out = (today + timedelta(days=CHECK_IN_OFFSET_DAYS + STAY_NIGHTS)).strftime("%Y-%m-%d")
 
-    print("--- Phase 2 : Extraction des données ---")
-    listings_data = extract_listing_info(results)
+    print(f"Recherche pour Dubaï du {check_in} au {check_out}")
 
-    print("--- Phase 3 : Export CSV ---")
-    save_to_csv(listings_data)
+    # =========================
+    # 2. Appel à search_all
+    # =========================
+    # Paramètres basés sur l’exemple officiel du README pyairbnb
+    results = search_all(
+        check_in=check_in,
+        check_out=check_out,
+        ne_lat=NE_LAT,
+        ne_long=NE_LON,
+        sw_lat=SW_LAT,
+        sw_long=SW_LON,
+        zoom_value=12,
+        price_min=10,
+        price_max=1000,
+        place_type="Any",   # on ne filtre pas (conforme à l’exemple)
+        amenities=[],       # pas de filtre d’aménités pour l’instant
+        free_cancellation=False,
+        currency=CURRENCY,
+        language=LANGUAGE,
+        proxy_url="",       # pas de proxy
+    )
+
+    # On s’attend à ce que results soit une liste de logements
+    total_found = len(results) if isinstance(results, list) else 0
+    print(f"Nombre total de logements trouvés par search_all : {total_found}")
+
+    if not isinstance(results, list) or total_found == 0:
+        print("Aucun résultat ou format inattendu retourné par search_all. Arrêt.")
+        return
+
+    # On réduit à un petit échantillon pour le test
+    listings = results[:SAMPLE_SIZE]
+    print(f"On va traiter un échantillon de {len(listings)} logements.")
+
+    # =========================
+    # 3. Boucle sur l’échantillon + get_details
+    # =========================
+    rows = []
+
+    for idx, item in enumerate(listings, start=1):
+        # D’après la logique habituelle de l’API Airbnb,
+        # chaque item contient un sous-objet "listing" avec un "id".
+        listing_data = item.get("listing", {}) if isinstance(item, dict) else {}
+        room_id = listing_data.get("id") or item.get("id") if isinstance(item, dict) else None
+
+        if room_id is None:
+            print(f"[AVERTISSEMENT] Impossible de trouver l'id du logement pour l'élément {idx}, on saute.")
+            continue
+
+        room_id_str = str(room_id)
+        print(f"[{idx}] Traitement du logement room_id={room_id_str} ...")
+
+        # Appel à get_details selon l’exemple officiel pyairbnb
+        details = get_details(
+            room_id=room_id_str,
+            currency=CURRENCY,
+            proxy_url="",
+            adults=2,
+            language=LANGUAGE,
+        )
+
+        if not isinstance(details, dict):
+            print(f"[{idx}] Format inattendu pour get_details(room_id={room_id_str}), on saute.")
+            continue
+
+        # La structure exacte dépend de la réponse Airbnb ; la lib vise généralement
+        # un nœud principal "pdp_listing_detail". On tombe sinon sur le dict brut.
+        pdp = details.get("pdp_listing_detail") or details
+
+        if not isinstance(pdp, dict):
+            print(f"[{idx}] 'pdp_listing_detail' manquant ou non dict, on saute.")
+            continue
+
+        # =========================
+        # 3.1. Informations principales du listing
+        # =========================
+        license_code = pdp.get("license")
+        name = pdp.get("name")
+        city = pdp.get("city")
+        country = pdp.get("country")
+        neighbourhood = pdp.get("public_address")
+
+        # URL de l’annonce
+        listing_url = pdp.get("listing_url")
+        if not listing_url:
+            listing_url = f"https://www.airbnb.com/rooms/{room_id_str}"
+
+        # =========================
+        # 3.2. Informations sur l’hôte (host)
+        # =========================
+        # La lib pyairbnb renvoie typiquement un bloc "primary_host" ou "host"
+        host = pdp.get("primary_host") or pdp.get("host") or {}
+        if not isinstance(host, dict):
+            host = {}
+
+        host_id = host.get("id")
+        host_name = host.get("first_name") or host.get("name")
+        is_superhost = host.get("is_superhost")
+
+        host_profile_url = f"https://www.airbnb.com/users/show/{host_id}" if host_id else None
+
+        # =========================
+        # 3.3. Notes et avis
+        # =========================
+        avg_rating = pdp.get("avg_rating") or pdp.get("overall_rating")
+        reviews_count = pdp.get("reviews_count") or pdp.get("review_count")
+
+        # =========================
+        # 3.4. Capacité et caractéristiques
+        # =========================
+        max_guests = pdp.get("person_capacity") or pdp.get("guest_count")
+        bedrooms = pdp.get("bedrooms")
+        bathrooms = pdp.get("bathrooms") or pdp.get("bathroom_label")
+
+        # =========================
+        # 3.5. Prix de base
+        # =========================
+        price_detail = pdp.get("price") or pdp.get("pricing_quote") or {}
+        if not isinstance(price_detail, dict):
+            price_detail = {}
+
+        nightly_price = price_detail.get("rate") or price_detail.get("amount")
+        currency = price_detail.get("currency") or CURRENCY
+
+        # =========================
+        # 3.6. Ligne pour le CSV
+        # =========================
+        row = {
+            "room_id": room_id_str,
+            "name": name,
+            "city": city,
+            "country": country,
+            "neighbourhood": neighbourhood,
+            "license": license_code,
+            "listing_url": listing_url,
+            "host_id": host_id,
+            "host_name": host_name,
+            "host_profile_url": host_profile_url,
+            "is_superhost": is_superhost,
+            "avg_rating": avg_rating,
+            "reviews_count": reviews_count,
+            "max_guests": max_guests,
+            "bedrooms": bedrooms,
+            "bathrooms": bathrooms,
+            "nightly_price": nightly_price,
+            "price_currency": currency,
+        }
+
+        rows.append(row)
+
+    # =========================
+    # 4. Écriture du CSV
+    # =========================
+    output_file = "dubai_listings.csv"
+    fieldnames = [
+        "room_id",
+        "name",
+        "city",
+        "country",
+        "neighbourhood",
+        "license",
+        "listing_url",
+        "host_id",
+        "host_name",
+        "host_profile_url",
+        "is_superhost",
+        "avg_rating",
+        "reviews_count",
+        "max_guests",
+        "bedrooms",
+        "bathrooms",
+        "nightly_price",
+        "price_currency",
+    ]
+
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Fichier CSV généré : {output_file}")
+    print(f"Nombre de lignes écrites : {len(rows)}")
+
 
 if __name__ == "__main__":
     main()
