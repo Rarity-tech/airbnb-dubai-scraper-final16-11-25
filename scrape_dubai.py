@@ -11,7 +11,7 @@ import pyairbnb
 # ==========================
 # ⚙️ CONTRÔLE DU RUN
 # ==========================
-LISTINGS_PER_RUN = 200  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999
+LISTINGS_PER_RUN = 50  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999
 
 
 # ==========================
@@ -172,8 +172,6 @@ def search_zone_with_retry(zone):
         sw_long=zone["sw_long"],
         zoom_value=ZOOM_VALUE,
         currency=CURRENCY,
-        language=LANGUAGE,
-        proxy_url=PROXY_URL,
     )
 
 
