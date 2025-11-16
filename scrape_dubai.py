@@ -1,335 +1,362 @@
 import os
 import csv
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Set, Tuple
+import datetime as dt
+from pathlib import Path
 
-import pyairbnb  # type: ignore
+from pyairbnb import Airbnb
 
+# -----------------------------------------------------------------------------
+# Configuration générale
+# -----------------------------------------------------------------------------
 
-CSV_PATH = "dubai_listings.csv"
+# Nombre max de listings à traiter par run (configurable via l'environnement)
 LISTINGS_PER_RUN = int(os.getenv("LISTINGS_PER_RUN", "50"))
-CURRENCY = os.getenv("CURRENCY", "AED")
-LANGUAGE = os.getenv("LANGUAGE", "en")
+
+# Fichier de sortie
+CSV_PATH = Path("dubai_listings.csv")
+
+# Bounding box approximative de Dubaï
+DUBAI_SW = (24.85, 54.95)  # (lat_min, lon_min)
+DUBAI_NE = (25.35, 55.45)  # (lat_max, lon_max)
+GRID_ROWS = 3
+GRID_COLS = 4
+
+# Fenêtre de dates pour le pricing (à adapter si besoin)
+CHECKIN_OFFSET_DAYS = 14
+STAY_NIGHTS = 5
 
 
-def banner(msg: str) -> None:
-    print("=" * 79)
-    if msg:
-        print(msg)
-    print("=" * 79)
+# -----------------------------------------------------------------------------
+# Utilitaires
+# -----------------------------------------------------------------------------
+
+def compute_dates():
+    today = dt.date.today()
+    check_in = today + dt.timedelta(days=CHECKIN_OFFSET_DAYS)
+    check_out = check_in + dt.timedelta(days=STAY_NIGHTS)
+    return check_in, check_out
 
 
-def compute_date_range() -> Tuple[str, str]:
-    """Check-in dans 14 jours, 5 nuits par défaut."""
-    today = datetime.utcnow().date()
-    check_in = today + timedelta(days=14)
-    check_out = check_in + timedelta(days=5)
-    return check_in.isoformat(), check_out.isoformat()
+def generate_zones():
+    lat_min, lon_min = DUBAI_SW
+    lat_max, lon_max = DUBAI_NE
+    d_lat = (lat_max - lat_min) / GRID_ROWS
+    d_lon = (lon_max - lon_min) / GRID_COLS
 
-
-def build_dubai_grid(rows: int = 3, cols: int = 4) -> List[Dict[str, Any]]:
-    """Grille Dubai (3x4) reproduisant les coordonnées des logs."""
-    sw_lat, sw_lng = 24.8500, 54.9500
-    ne_lat, ne_lng = 25.3501, 55.4500
-
-    d_lat = (ne_lat - sw_lat) / rows
-    d_lng = (ne_lng - sw_lng) / cols
-
-    zones: List[Dict[str, Any]] = []
-    for i in range(rows):
-        for j in range(cols):
-            z_sw_lat = sw_lat + i * d_lat
-            z_sw_lng = sw_lng + j * d_lng
-            z_ne_lat = sw_lat + (i + 1) * d_lat
-            z_ne_lng = sw_lng + (j + 1) * d_lng
-            zones.append(
-                {
-                    "name": f"zone_{i+1}_{j+1}",
-                    "sw_lat": round(z_sw_lat, 4),
-                    "sw_lng": round(z_sw_lng, 4),
-                    "ne_lat": round(z_ne_lat, 4),
-                    "ne_lng": round(z_ne_lng, 4),
-                }
-            )
+    zones = []
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            sw_lat = lat_min + r * d_lat
+            sw_lon = lon_min + c * d_lon
+            ne_lat = sw_lat + d_lat
+            ne_lon = sw_lon + d_lon
+            zones.append((f"zone_{r+1}_{c+1}", sw_lat, sw_lon, ne_lat, ne_lon))
     return zones
 
 
-def load_existing_ids() -> Set[str]:
-    if not os.path.exists(CSV_PATH):
+def load_existing_ids():
+    if not CSV_PATH.exists():
         return set()
-    ids: Set[str] = set()
-    with open(CSV_PATH, newline="", encoding="utf-8") as f:
+    ids = set()
+    with CSV_PATH.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             rid = row.get("room_id")
             if rid:
-                ids.add(str(rid))
+                ids.add(rid)
     return ids
 
 
-def ensure_csv_header() -> None:
-    if os.path.exists(CSV_PATH):
-        return
-    fieldnames = [
-        "room_id",
-        "url",
-        "title",
-        "neighbourhood",
-        "city",
-        "latitude",
-        "longitude",
-        "price",
-        "currency",
-        "rating",
-        "reviews_count",
-        "host_id",
-        "host_name",
-        "license",
-        "created_at",
-    ]
-    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+CSV_COLUMNS = [
+    "room_id",
+    "name",
+    "url",
+    "city",
+    "neighbourhood",
+    "latitude",
+    "longitude",
+    "property_type",
+    "room_type",
+    "accommodates",
+    "bathrooms",
+    "bedrooms",
+    "beds",
+    "amenities",
+    "price_total",
+    "price_currency",
+    "is_superhost",
+    "rating",
+    "reviews_count",
+    "license",
+    "instant_bookable",
+    "min_nights",
+    "max_nights",
+    "host_id",
+    "host_name",
+    "host_since",
+    "host_is_superhost",
+    "host_total_listings",
+]
 
 
-def extract_room_ids(search_results: Any) -> List[str]:
-    """Extrait une liste de room_id à partir de la réponse search_all()."""
-    room_ids: List[str] = []
-    if not isinstance(search_results, list):
-        return room_ids
-
-    for item in search_results:
-        if not isinstance(item, dict):
-            continue
-        room_id = (
-            item.get("room_id")
-            or item.get("id")
-            or item.get("listing_id")
-        )
-        if room_id is None:
-            continue
-        room_ids.append(str(room_id))
-    return room_ids
+def ensure_csv_header():
+    if not CSV_PATH.exists():
+        with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            writer.writeheader()
 
 
-def search_room_ids(check_in: str, check_out: str) -> List[str]:
-    zones = build_dubai_grid()
-    all_ids: Set[str] = set()
-
-    print("🔍 Phase 1: Recherche des room_ids")
-    print(f"   Zones : {len(zones)}")
-    print(f"   Dates : {check_in} → {check_out}")
-    print()
-
-    for idx, zone in enumerate(zones, start=1):
-        print(
-            f"[{idx}/{len(zones)}] 📍 {zone['name']} "
-            f"({zone['sw_lat']:.4f},{zone['sw_lng']:.4f}) → "
-            f"({zone['ne_lat']:.4f},{zone['ne_lng']:.4f})..."
-        )
-
-        try:
-            # CORRECTION IMPORTANTE: check_in / check_out (avec underscore)
-            results = pyairbnb.search_all(
-                check_in=check_in,
-                check_out=check_out,
-                ne_lat=zone["ne_lat"],
-                ne_long=zone["ne_lng"],
-                sw_lat=zone["sw_lat"],
-                sw_long=zone["sw_lng"],
-                zoom_value=12,
-                price_min=0,
-                price_max=0,
-                place_type="",
-                amenities=[],
-                free_cancellation=False,
-                currency=CURRENCY,
-                language=LANGUAGE,
-                proxy_url="",
-            )
-            zone_ids = extract_room_ids(results)
-            print(f"   ✓ {len(zone_ids)} résultats")
-            all_ids.update(zone_ids)
-        except TypeError as e:
-            print(f"   ⚠️ Erreur pendant la recherche de la zone {zone['name']}: {e}")
-        except Exception as e:
-            print(f"   ⚠️ Erreur inattendue pour la zone {zone['name']}: {e}")
-    print()
-    print(f"✅ Phase 1 terminée: {len(all_ids)} room_ids uniques trouvés")
-    print()
-    return list(all_ids)
-
-
-def get_nested(d: Dict[str, Any], path: str, default=None):
-    cur: Any = d
-    for part in path.split("."):
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(part)
-        if cur is None:
+def safe_get(obj, *keys, default=None):
+    cur = obj
+    for k in keys:
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
             return default
     return cur
 
 
-def fetch_listing_details(room_ids: List[str], already_in_csv: Set[str]) -> int:
-    if not room_ids:
-        print("ℹ️ Aucun listing à traiter en Phase 2.")
-        return 0
+# -----------------------------------------------------------------------------
+# Extraction des infos détaillées d'un listing
+# -----------------------------------------------------------------------------
 
-    remaining_ids = [rid for rid in room_ids if rid not in already_in_csv]
-    if not remaining_ids:
-        print("ℹ️ Tous les listings trouvés sont déjà dans le CSV.")
-        return 0
+def extract_listing_info(room_id, details, price_total=None, currency=None):
+    d = details or {}
 
-    to_process = remaining_ids[:LISTINGS_PER_RUN]
+    # pyairbnb renvoie typiquement un dict avec une clé "listing" ou
+    # "pdp_listing_detail". On combine les deux pour être robuste.
+    listing = d.get("listing") or d.get("pdp_listing_detail") or {}
+    pdp = d.get("pdp_listing_detail") or {}
+    primary_host = (
+        listing.get("primary_host")
+        or pdp.get("primary_host")
+        or {}
+    )
 
-    print("🏗️ Phase 2: Récupération des détails listings")
-    print(f"   • Déjà dans CSV : {len(already_in_csv)}")
-    print(f"   • Nouveaux trouvés (Phase 1) : {len(room_ids)}")
-    print(f"   • À traiter dans ce run : {len(to_process)} (max {LISTINGS_PER_RUN})")
+    room_type = (
+        listing.get("room_type")
+        or safe_get(pdp, "room_and_property_type", "display_type")
+    )
+
+    neighbourhood = (
+        listing.get("neighborhood")
+        or listing.get("neighborhood_overview")
+        or listing.get("localized_neighborhood")
+        or safe_get(pdp, "neighborhood", "name")
+    )
+
+    # Gestion robuste de la liste d'amenities
+    amenities_raw = listing.get("amenities") or safe_get(pdp, "listing_amenities")
+    if isinstance(amenities_raw, list):
+        amenities = ", ".join(
+            sorted(
+                {
+                    a["name"]
+                    if isinstance(a, dict) and "name" in a
+                    else str(a)
+                    for a in amenities_raw
+                }
+            )
+        )
+    else:
+        amenities = None
+
+    return {
+        "room_id": str(room_id),
+        "name": listing.get("name") or pdp.get("name"),
+        "url": f"https://www.airbnb.com/rooms/{room_id}",
+        "city": listing.get("city")
+        or listing.get("localized_city")
+        or pdp.get("city"),
+        "neighbourhood": neighbourhood,
+        "latitude": listing.get("lat")
+        or listing.get("latitude")
+        or pdp.get("lat"),
+        "longitude": listing.get("lng")
+        or listing.get("longitude")
+        or pdp.get("lng"),
+        "property_type": listing.get("property_type")
+        or safe_get(pdp, "room_and_property_type", "property_type"),
+        "room_type": room_type,
+        "accommodates": listing.get("person_capacity")
+        or listing.get("accommodates")
+        or pdp.get("person_capacity"),
+        "bathrooms": listing.get("bathrooms")
+        or listing.get("bathrooms_number")
+        or pdp.get("bathrooms"),
+        "bedrooms": listing.get("bedrooms") or pdp.get("bedrooms"),
+        "beds": listing.get("beds") or pdp.get("beds"),
+        "amenities": amenities,
+        "price_total": price_total,
+        "price_currency": currency,
+        "is_superhost": primary_host.get("is_superhost"),
+        "rating": listing.get("star_rating")
+        or listing.get("avg_rating")
+        or pdp.get("star_rating"),
+        "reviews_count": listing.get("reviews_count")
+        or pdp.get("reviews_count"),
+        "license": listing.get("license") or pdp.get("license"),
+        "instant_bookable": listing.get("instant_bookable")
+        or pdp.get("is_instant_bookable"),
+        "min_nights": listing.get("min_nights")
+        or listing.get("minimum_nights")
+        or pdp.get("min_nights"),
+        "max_nights": listing.get("max_nights")
+        or listing.get("maximum_nights")
+        or pdp.get("max_nights"),
+        "host_id": primary_host.get("id"),
+        "host_name": primary_host.get("host_name")
+        or primary_host.get("name"),
+        "host_since": primary_host.get("since")
+        or primary_host.get("host_since"),
+        "host_is_superhost": primary_host.get("is_superhost"),
+        "host_total_listings": primary_host.get("total_listings_count"),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Script principal
+# -----------------------------------------------------------------------------
+
+def main():
+    check_in, check_out = compute_dates()
+
+    print("=" * 78)
+    print(f"🚀 SCRAPING DUBAI - {dt.datetime.now():%Y-%m-%d %H:%M:%S}")
+    print("=" * 78)
+    print(f"📊 Configuration: {LISTINGS_PER_RUN} listings ce run\n")
+
+    print("🔍 Phase 1: Recherche des room_ids")
+    zones = generate_zones()
+    print(f"   Zones : {len(zones)}")
+    print(f"   Dates : {check_in} → {check_out}\n")
+
+    client = Airbnb()
+    all_ids = set()
+
+    for idx, (zone_name, sw_lat, sw_lon, ne_lat, ne_lon) in enumerate(zones, start=1):
+        print(
+            f"[{idx}/{len(zones)}] 📍 {zone_name} "
+            f"({sw_lat:.4f},{sw_lon:.4f}) → ({ne_lat:.4f},{ne_lon:.4f})..."
+        )
+        try:
+            # Signature basée sur la doc pyairbnb: search_all(
+            #   check_in, check_out,
+            #   ne_lat, ne_long,
+            #   sw_lat, sw_long,
+            #   zoom_value,
+            #   currency,
+            #   place_type,
+            #   price_min, price_max,
+            #   amenities,
+            #   language,
+            # )
+            results = client.search_all(
+                check_in.isoformat(),
+                check_out.isoformat(),
+                ne_lat,
+                ne_lon,
+                sw_lat,
+                sw_lon,
+                15,  # zoom_value
+                "USD",
+                None,  # place_type
+                None,  # price_min
+                None,  # price_max
+                None,  # amenities
+                "en",
+            )
+            ids_zone = {str(item.get("id")) for item in results if item.get("id") is not None}
+            print(f"   ✓ {len(ids_zone)} résultats")
+            all_ids.update(ids_zone)
+        except Exception as e:
+            print(f"   ⚠️ Erreur pendant la recherche de la zone {zone_name}: {e}")
+            print("   ✓ 0 résultats")
+
     print()
+    print(f"✅ Phase 1 terminée: {len(all_ids)} room_ids uniques trouvés\n")
 
-    ensure_csv_header()
-    added = 0
-
-    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "room_id",
-            "url",
-            "title",
-            "neighbourhood",
-            "city",
-            "latitude",
-            "longitude",
-            "price",
-            "currency",
-            "rating",
-            "reviews_count",
-            "host_id",
-            "host_name",
-            "license",
-            "created_at",
-        ])
-
-        for idx, rid in enumerate(to_process, start=1):
-            print(f"[{idx}/{len(to_process)}] 🏠 room_id={rid} ...")
-            try:
-                data = pyairbnb.get_details(
-                    room_id=int(rid),
-                    currency=CURRENCY,
-                    proxy_url="",
-                    adults=2,
-                    language=LANGUAGE,
-                )
-
-                if isinstance(data, tuple):
-                    data = data[0]
-
-                listing = get_nested(data, "pdp_listing_detail", {}) or data
-
-                url = get_nested(listing, "sectioned_description.product_url", "")
-                if not url:
-                    url = f"https://www.airbnb.com/rooms/{rid}"
-
-                title = (
-                    get_nested(listing, "p3_summary_title", "")
-                    or listing.get("name")
-                    or ""
-                )
-                neighbourhood = (
-                    get_nested(listing, "location.neighborhood", "")
-                    or get_nested(listing, "localized_city", "")
-                    or ""
-                )
-                city = (
-                    get_nested(listing, "location.city", "")
-                    or get_nested(listing, "localized_city", "")
-                    or ""
-                )
-                latitude = get_nested(listing, "lat", "")
-                longitude = get_nested(listing, "lng", "")
-
-                price = get_nested(listing, "p3_event_data.price.price_string", "")
-                if isinstance(price, dict):
-                    price = price.get("amount", "")
-
-                rating = get_nested(listing, "star_rating", "")
-                reviews_count = get_nested(listing, "reviews_count", "")
-
-                host = get_nested(listing, "primary_host", {}) or {}
-                host_id = host.get("id", "")
-                host_name = host.get("host_name", "") or host.get("name", "")
-
-                license_code = (
-                    listing.get("license")
-                    or get_nested(listing, "license", "")
-                    or ""
-                )
-
-                writer.writerow(
-                    {
-                        "room_id": rid,
-                        "url": url,
-                        "title": title,
-                        "neighbourhood": neighbourhood,
-                        "city": city,
-                        "latitude": latitude,
-                        "longitude": longitude,
-                        "price": price,
-                        "currency": CURRENCY,
-                        "rating": rating,
-                        "reviews_count": reviews_count,
-                        "host_id": host_id,
-                        "host_name": host_name,
-                        "license": license_code,
-                        "created_at": datetime.utcnow().isoformat(),
-                    }
-                )
-                added += 1
-            except Exception as e:
-                print(f"   ⚠️ Erreur pour room_id {rid}: {e}")
-
-    print()
-    print(f"✅ Phase 2 terminée: {added} listings ajoutés dans ce run")
-    return added
-
-
-def main() -> None:
-    banner(f"🚀 SCRAPING DUBAI - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"📊 Configuration: {LISTINGS_PER_RUN} listings ce run")
-    print()
-    check_in, check_out = compute_date_range()
-
-    # Phase 1
-    room_ids = search_room_ids(check_in, check_out)
-
-    # Statut intermédiaire
-    in_csv = load_existing_ids()
-    total_found = len(room_ids)
-    already = len(in_csv.intersection(set(room_ids)))
-    remaining = max(0, total_found - already)
+    existing_ids = load_existing_ids()
+    remaining_ids = [rid for rid in all_ids if rid not in existing_ids]
 
     print("📊 Statut:")
-    print(f"   • Total Dubai (IDs trouvés): {total_found}")
-    print(f"   • Déjà traités: {already}")
-    print(f"   • Restants: {remaining}")
-    print(f"   • Ce run (max): {LISTINGS_PER_RUN}")
-    print()
+    print(f"   • Total Dubai (IDs trouvés): {len(all_ids)}")
+    print(f"   • Déjà traités: {len(existing_ids)}")
+    print(f"   • Restants: {len(remaining_ids)}")
 
-    # Phase 2
-    added = fetch_listing_details(room_ids, in_csv)
+    if not remaining_ids:
+        print("ℹ️ Aucun listing à traiter en Phase 2.")
+        return
 
-    final_total = len(load_existing_ids())
-    restants = max(0, total_found - final_total)
+    to_process = remaining_ids[:LISTINGS_PER_RUN]
+    print(f"   • Ce run (max): {len(to_process)}\n")
 
-    banner("🎉 RUN TERMINÉ")
-    print(f"📊 Ce run: +{added} listings")
-    print(f"📊 Total dans CSV: {final_total} listings")
-    print(f"📊 Restants (approx): {restants}")
-    print()
-    print("💡 Pour continuer: relance le workflow")
+    print("🏗️ Phase 2: Récupération des détails listings")
+    ensure_csv_header()
+
+    rows_to_append = []
+    processed = 0
+
+    for idx, room_id in enumerate(to_process, start=1):
+        print(f"[{idx}/{len(to_process)}] 🏠 room_id={room_id} ...")
+        try:
+            details = client.get_details(
+                room_id=room_id,
+                currency="USD",
+                adults=2,
+                language="en",
+            )
+
+            # Prix total pour les dates choisies (si la fonction échoue, on ignore le prix)
+            price_total = None
+            currency = "USD"
+            try:
+                price_info = client.get_price(
+                    check_in.isoformat(),
+                    check_out.isoformat(),
+                    room_id=room_id,
+                    currency="USD",
+                )
+                if isinstance(price_info, dict):
+                    price_total = (
+                        price_info.get("price_total")
+                        or price_info.get("total_price")
+                        or price_info.get("price")
+                    )
+                    currency = price_info.get("currency") or "USD"
+            except Exception:
+                pass
+
+            row = extract_listing_info(
+                room_id,
+                details,
+                price_total=price_total,
+                currency=currency,
+            )
+            rows_to_append.append(row)
+            processed += 1
+        except Exception as e:
+            print(f"   ⚠️ Erreur pour room_id {room_id}: {e}")
+
+    if rows_to_append:
+        with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            for row in rows_to_append:
+                writer.writerow(row)
+
+    print(f"\n✅ Phase 2 terminée: {processed} listings ajoutés dans ce run")
+    print("=" * 78)
+    print("🎉 RUN TERMINÉ")
+    print("=" * 78)
+    print(f"📊 Ce run: +{processed} listings")
+
+    total = len(existing_ids) + processed
+    approx_remaining = max(len(all_ids) - total, 0)
+    print(f"📊 Total dans CSV: {total} listings")
+    print(f"📊 Restants (approx): {approx_remaining}")
+    print("\n💡 Pour continuer: relance le workflow")
     print("   (ou augmente LISTINGS_PER_RUN si tu veux aller plus vite)")
-    banner("")
+    print("=" * 78)
 
 
 if __name__ == "__main__":
