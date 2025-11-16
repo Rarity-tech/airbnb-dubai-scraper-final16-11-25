@@ -1,6 +1,9 @@
 import csv
+import json
+import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import wraps
 
 import pyairbnb
 
@@ -9,30 +12,56 @@ import pyairbnb
 # CONFIG GLOBALE
 # ==========================
 
-# Dates pour la recherche (nécessaires pour Airbnb, même si tu ne regardes pas les prix) :contentReference[oaicite:3]{index=3}
-CHECK_IN = "2026-01-10"
-CHECK_OUT = "2026-01-15"
+# Dates dynamiques (2 semaines dans le futur pour max résultats)
+future_date = datetime.now() + timedelta(days=14)
+CHECK_IN = future_date.strftime("%Y-%m-%d")
+CHECK_OUT = (future_date + timedelta(days=5)).strftime("%Y-%m-%d")
 
 CURRENCY = "AED"
 LANGUAGE = "en"
-PROXY_URL = ""  # laisse vide si tu n'as pas de proxy
+PROXY_URL = ""
 
-# Zoom conseillé pour une grande ville (cf. exemples officiels) :contentReference[oaicite:4]{index=4}
-ZOOM_VALUE = 10
+# Zoom recommandé pour grande ville (cf. doc pyairbnb)
+ZOOM_VALUE = 3
 
-# Limitation simple pour ne pas attaquer trop vite Airbnb (en secondes)
-DELAY_BETWEEN_DETAIL_CALLS = 0.3  # 0.3s ~ raisonnable
+# Délais anti-rate-limit
+DELAY_BETWEEN_DETAIL_CALLS = 0.5  # Augmenté à 0.5s pour sécurité
+DELAY_BETWEEN_ZONES = 2.0  # Pause entre zones
+
+# Checkpoints
+CHECKPOINT_FILE = "checkpoint_progress.json"
+BATCH_SIZE = 50  # Sauvegarder tous les 50 listings
 
 
 # ==========================
 # UTILITAIRES
 # ==========================
 
-def build_dubai_subzones(rows=3, cols=4):
-    """
-    Divise la bounding box de Dubaï en rows x cols sous-zones.
+def retry_on_failure(max_retries=3, delay=2):
+    """Decorator pour retry avec backoff exponentiel"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        print(f"❌ Échec définitif après {max_retries} tentatives: {e}", flush=True)
+                        raise
+                    wait_time = delay * (2 ** attempt)
+                    print(f"⚠️ Tentative {attempt + 1}/{max_retries} échouée: {e}. Retry dans {wait_time}s", flush=True)
+                    time.sleep(wait_time)
+            return None
+        return wrapper
+    return decorator
 
-    Coordonnées de Dubaï (viewport Google): :contentReference[oaicite:5]{index=5}
+
+def build_dubai_subzones(rows=3, cols=4, overlap_percent=0.1):
+    """
+    Divise Dubai en sous-zones avec overlap pour ne rien manquer.
+    
+    Coordonnées Dubai:
     north = 25.3585607
     south = 24.7921359
     east  = 55.5650393
@@ -45,31 +74,31 @@ def build_dubai_subzones(rows=3, cols=4):
 
     lat_step = (north - south) / rows
     lng_step = (east - west) / cols
+    
+    # Overlap pour sécurité
+    lat_overlap = lat_step * overlap_percent
+    lng_overlap = lng_step * overlap_percent
 
     zones = []
     for r in range(rows):
         for c in range(cols):
-            z_sw_lat = south + r * lat_step
-            z_sw_lng = west + c * lng_step
-            z_ne_lat = z_sw_lat + lat_step
-            z_ne_lng = z_sw_lng + lng_step
-            zones.append(
-                {
-                    "name": f"zone_{r+1}_{c+1}",
-                    "ne_lat": z_ne_lat,
-                    "ne_long": z_ne_lng,
-                    "sw_lat": z_sw_lat,
-                    "sw_long": z_sw_lng,
-                }
-            )
+            z_sw_lat = max(south, south + r * lat_step - lat_overlap)
+            z_sw_lng = max(west, west + c * lng_step - lng_overlap)
+            z_ne_lat = min(north, z_sw_lat + lat_step + lat_overlap)
+            z_ne_lng = min(east, z_sw_lng + lng_step + lng_overlap)
+            
+            zones.append({
+                "name": f"zone_{r+1}_{c+1}",
+                "ne_lat": z_ne_lat,
+                "ne_long": z_ne_lng,
+                "sw_lat": z_sw_lat,
+                "sw_long": z_sw_lng,
+            })
     return zones
 
 
 def try_paths(obj, paths, default=""):
-    """
-    Essaie plusieurs chemins possibles (dotted path) dans un gros JSON
-    en utilisant pyairbnb.get_nested_value, qui est prévu pour ça. :contentReference[oaicite:6]{index=6}
-    """
+    """Essaie plusieurs chemins possibles dans un JSON"""
     for p in paths:
         try:
             val = pyairbnb.get_nested_value(obj, p, None)
@@ -81,6 +110,7 @@ def try_paths(obj, paths, default=""):
 
 
 def safe_int(value, default=None):
+    """Conversion sécurisée en int"""
     try:
         return int(value)
     except Exception:
@@ -88,73 +118,102 @@ def safe_int(value, default=None):
 
 
 # ==========================
-# SCRAPING
+# SCRAPING OPTIMISÉ
 # ==========================
 
-def collect_listing_ids_for_dubai():
+@retry_on_failure(max_retries=3, delay=2)
+def search_zone_with_retry(zone):
+    """Recherche dans une zone avec retry automatique"""
+    return pyairbnb.search_all(
+        check_in=CHECK_IN,
+        check_out=CHECK_OUT,
+        ne_lat=zone["ne_lat"],
+        ne_long=zone["ne_long"],
+        sw_lat=zone["sw_lat"],
+        sw_long=zone["sw_long"],
+        zoom_value=ZOOM_VALUE,
+        price_min=0,
+        price_max=0,
+        currency=CURRENCY,
+        language=LANGUAGE,
+        proxy_url=PROXY_URL,
+    )
+
+
+def collect_listings_with_basic_info():
     """
-    Utilise pyairbnb.search_all sur 12 sous-zones pour récupérer tous les listing IDs de Dubaï. :contentReference[oaicite:7]{index=7}
+    Phase 1: Récupère tous les listings avec infos basiques host
+    depuis search_all (SANS appeler get_details)
     """
-    zones = build_dubai_subzones(rows=3, cols=4)
-    listing_ids = set()
+    zones = build_dubai_subzones(rows=3, cols=4, overlap_percent=0.1)
+    listings_data = {}  # Clé = listing_id
+    
+    print(f"\n🔍 Phase 1: Recherche dans {len(zones)} sous-zones de Dubai", flush=True)
+    print(f"📅 Dates: {CHECK_IN} → {CHECK_OUT}\n", flush=True)
 
-    print(f"Nombre de sous-zones à traiter : {len(zones)}", flush=True)
+    for idx, zone in enumerate(zones, start=1):
+        print(f"[{idx}/{len(zones)}] 📍 Zone {zone['name']}...", end=" ", flush=True)
 
-    for zone in zones:
-        print(f"--- Recherche sur {zone['name']} ---", flush=True)
+        try:
+            search_results = search_zone_with_retry(zone)
+        except Exception as e:
+            print(f"❌ Échec: {e}", flush=True)
+            continue
 
-        search_results = pyairbnb.search_all(
-            check_in=CHECK_IN,
-            check_out=CHECK_OUT,
-            ne_lat=zone["ne_lat"],
-            ne_long=zone["ne_long"],
-            sw_lat=zone["sw_lat"],
-            sw_long=zone["sw_long"],
-            zoom_value=ZOOM_VALUE,
-            price_min=0,
-            price_max=0,
-            place_type="",        # toutes les catégories
-            amenities=[],         # pas de filtre
-            free_cancellation=False,
-            currency=CURRENCY,
-            language=LANGUAGE,
-            proxy_url=PROXY_URL,
-        )
-
+        # Normaliser en liste
         if not isinstance(search_results, list):
-            # Selon les versions, search_all renvoie une liste ou une structure plus complexe.
-            # On essaie de récupérer une liste de listings au mieux.
             possible_list = pyairbnb.get_nested_value(search_results, "results", [])
-            if isinstance(possible_list, list):
-                search_results = possible_list
-            else:
-                print(f"Format inattendu pour {zone['name']}, on continue.", flush=True)
-                continue
+            search_results = possible_list if isinstance(possible_list, list) else []
 
-        print(f"{zone['name']}: {len(search_results)} résultats bruts", flush=True)
+        print(f"✓ {len(search_results)} résultats", flush=True)
 
         for item in search_results:
-            # Beaucoup de scrapers Airbnb ont une structure type "listing.id"
-            # On essaie cette structure d'abord, puis un id direct.
-            lid = try_paths(item, ["listing.id", "id"])
-            if not lid:
+            listing_id = try_paths(item, ["listing.id", "id"])
+            if not listing_id:
                 continue
-            # On force en string pour construire l'URL plus tard
-            listing_ids.add(str(lid))
+            
+            listing_id = str(listing_id)
+            
+            # Déduplication
+            if listing_id in listings_data:
+                continue
+            
+            # Extraire infos basiques (déjà disponibles dans search_all!)
+            listing_title = try_paths(item, ["listing.name", "listing.title"], "")
+            
+            # HOST INFO - Déjà présent dans search_all
+            host_id = try_paths(item, ["listing.user.id", "user.id"], "")
+            host_name = try_paths(item, ["listing.user.first_name", "user.first_name"], "")
+            is_superhost = try_paths(item, ["listing.user.is_superhost", "user.is_superhost"], False)
+            
+            listings_data[listing_id] = {
+                "listing_id": listing_id,
+                "listing_title": listing_title,
+                "host_id": str(host_id) if host_id else "",
+                "host_name": host_name,
+                "is_superhost": is_superhost,
+                # Ces champs seront remplis en Phase 2 si nécessaire
+                "license_code": "",
+                "host_rating": "",
+                "host_reviews_count": "",
+                "host_joined_year": "",
+                "host_years_active": "",
+            }
 
-        print(f"Total d'IDs uniques cumulés: {len(listing_ids)}", flush=True)
+        # Pause entre zones pour éviter rate limit
+        if idx < len(zones):
+            time.sleep(DELAY_BETWEEN_ZONES)
+    
+    print(f"\n✅ Phase 1 terminée: {len(listings_data)} listings uniques trouvés\n", flush=True)
+    return listings_data
 
-    return sorted(listing_ids)
 
-
-def get_listing_and_host_details(listing_id: str):
-    """
-    Récupère les détails complets pour une annonce + les infos host.
-    Utilise pyairbnb.get_details comme dans la doc. :contentReference[oaicite:8]{index=8}
-    """
+@retry_on_failure(max_retries=3, delay=2)
+def get_listing_details_with_retry(listing_id):
+    """Appel get_details avec retry automatique"""
     rid_int = safe_int(listing_id, listing_id)
-
-    data = pyairbnb.get_details(
+    
+    return pyairbnb.get_details(
         room_id=rid_int,
         currency=CURRENCY,
         proxy_url=PROXY_URL,
@@ -162,152 +221,180 @@ def get_listing_and_host_details(listing_id: str):
         language=LANGUAGE,
     )
 
-    # Listing
-    listing_title = try_paths(
-        data,
-        [
-            "pdp_listing_detail.name",
-            "listing.title",
-            "listing.name",
-        ],
-        default="",
-    )
 
-    license_code = try_paths(
-        data,
-        [
-            "pdp_listing_detail.license_number",
-            "pdp_listing_detail.license",
-            "listing.license_number",
-            "listing.license",
-        ],
-        default="",
-    )
-
-    dtcm_link = ""
-    if license_code:
-        dtcm_link = (
-            "https://hhpermits.det.gov.ae/holidayhomes/Customization/"
-            "DTCM/CustomPages/HHQRCode.aspx?r=" + str(license_code)
-        )
-
-    # Host
-    host_id = try_paths(
-        data,
-        [
-            "pdp_listing_detail.primary_host.id",
-            "primary_host.id",
-            "listing.primary_host.id",
-        ],
-        default="",
-    )
-    host_name = try_paths(
-        data,
-        [
-            "pdp_listing_detail.primary_host.full_name",
-            "primary_host.full_name",
-            "primary_host.name",
-        ],
-        default="",
-    )
-
-    host_rating = try_paths(
-        data,
-        [
-            "pdp_listing_detail.primary_host.overall_rating",
-            "primary_host.overall_rating",
-            "primary_host.overallRatingLocalized",
-        ],
-        default="",
-    )
-
-    host_reviews_count = try_paths(
-        data,
-        [
-            "pdp_listing_detail.primary_host.review_count",
-            "primary_host.review_count",
-        ],
-        default="",
-    )
-
-    member_since = try_paths(
-        data,
-        [
-            "pdp_listing_detail.primary_host.member_since",
-            "primary_host.member_since",
-        ],
-        default="",
-    )
-
-    joined_year = ""
-    years_active = ""
-
-    if isinstance(member_since, str) and len(member_since) >= 4:
-        try:
-            joined_year_int = int(member_since[:4])
-            joined_year = joined_year_int
-            current_year = datetime.utcnow().year
-            years_active = current_year - joined_year_int
-        except Exception:
-            joined_year = ""
-            years_active = ""
-
-    host_profile_url = ""
-    if host_id:
-        host_profile_url = f"https://www.airbnb.com/users/show/{host_id}"
-
-    listing_url = f"https://www.airbnb.com/rooms/{listing_id}"
-
-    return {
-        "listing_id": listing_id,
-        "listing_url": listing_url,
-        "listing_title": listing_title,
-        "license_code": license_code,
-        "dtcm_link": dtcm_link,
-        "host_id": host_id,
-        "host_name": host_name,
-        "host_profile_url": host_profile_url,
-        "host_rating": host_rating,
-        "host_reviews_count": host_reviews_count,
-        "host_joined_year": joined_year,
-        "host_years_active": years_active,
-    }
-
-
-def scrape_dubai_to_csv(output_csv_path: str):
-    # 1) Récupérer tous les IDs d’annonces
-    listing_ids = collect_listing_ids_for_dubai()
-    print(f"Nombre total d’annonces uniques trouvées pour Dubaï: {len(listing_ids)}", flush=True)
-
-    details_records = []
+def enrich_with_detailed_info(listings_data, max_details_calls=500):
+    """
+    Phase 2 (OPTIONNELLE): Enrichit avec get_details pour license + host details
+    
+    Pour Dubai avec 20,000+ listings, appeler get_details sur tous prendrait 3+ heures.
+    On limite à max_details_calls (par défaut 500) pour un échantillon représentatif.
+    
+    Priorisation:
+    1. Hosts avec plusieurs listings (probablement pros)
+    2. Superhosts
+    3. Random sample du reste
+    """
+    print(f"\n🔍 Phase 2: Enrichissement avec détails (max {max_details_calls} appels)\n", flush=True)
+    
+    # Charger checkpoint si existe
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r') as f:
+            checkpoint = json.load(f)
+        processed_ids = set(checkpoint.get("processed_ids", []))
+        print(f"📂 Checkpoint trouvé: {len(processed_ids)} déjà traités", flush=True)
+    else:
+        processed_ids = set()
+    
+    # Compter listings par host
     host_listing_count = {}
-
-    # 2) Pour chaque annonce, récupérer les détails + host
-    for idx, listing_id in enumerate(listing_ids, start=1):
-        print(f"[{idx}/{len(listing_ids)}] Détails pour listing {listing_id}", flush=True)
-
-        try:
-            record = get_listing_and_host_details(listing_id)
-        except Exception as e:
-            print(f"Erreur sur listing {listing_id}: {e}", flush=True)
-            time.sleep(1.0)
-            continue
-
-        details_records.append(record)
-
-        host_id = record.get("host_id")
+    for listing in listings_data.values():
+        host_id = listing["host_id"]
         if host_id:
             host_listing_count[host_id] = host_listing_count.get(host_id, 0) + 1
-
+    
+    # Prioriser les listings à enrichir
+    priority_queue = []
+    
+    # Priorité 1: Hosts avec 2+ listings (probablement pros)
+    for listing in listings_data.values():
+        host_id = listing["host_id"]
+        if host_id and host_listing_count.get(host_id, 0) >= 2:
+            priority_queue.append((3, listing["listing_id"]))  # Score 3
+    
+    # Priorité 2: Superhosts
+    for listing in listings_data.values():
+        if listing["is_superhost"]:
+            priority_queue.append((2, listing["listing_id"]))  # Score 2
+    
+    # Priorité 3: Reste (random)
+    import random
+    remaining = [lid for lid in listings_data.keys() 
+                 if lid not in [x[1] for x in priority_queue]]
+    random.shuffle(remaining)
+    for lid in remaining[:max_details_calls]:
+        priority_queue.append((1, lid))
+    
+    # Trier par priorité (score décroissant)
+    priority_queue.sort(reverse=True, key=lambda x: x[0])
+    
+    # Limiter au max
+    priority_queue = priority_queue[:max_details_calls]
+    to_process = [lid for _, lid in priority_queue if lid not in processed_ids]
+    
+    print(f"📊 À enrichir: {len(to_process)} listings (dont {len([x for x in priority_queue if x[0] == 3])} multi-listing hosts)", flush=True)
+    
+    for idx, listing_id in enumerate(to_process, start=1):
+        print(f"[{idx}/{len(to_process)}] 🔄 Détails pour {listing_id}...", end=" ", flush=True)
+        
+        try:
+            data = get_listing_details_with_retry(listing_id)
+            
+            # License
+            license_code = try_paths(data, [
+                "pdp_listing_detail.license_number",
+                "pdp_listing_detail.license",
+                "listing.license_number",
+            ], "")
+            
+            # Host details
+            host_rating = try_paths(data, [
+                "pdp_listing_detail.primary_host.overall_rating",
+                "primary_host.overall_rating",
+            ], "")
+            
+            host_reviews_count = try_paths(data, [
+                "pdp_listing_detail.primary_host.review_count",
+                "primary_host.review_count",
+            ], "")
+            
+            member_since = try_paths(data, [
+                "pdp_listing_detail.primary_host.member_since",
+                "primary_host.member_since",
+            ], "")
+            
+            joined_year = ""
+            years_active = ""
+            if isinstance(member_since, str) and len(member_since) >= 4:
+                try:
+                    joined_year_int = int(member_since[:4])
+                    joined_year = joined_year_int
+                    years_active = datetime.now().year - joined_year_int
+                except:
+                    pass
+            
+            # Mise à jour
+            listings_data[listing_id].update({
+                "license_code": license_code,
+                "host_rating": host_rating,
+                "host_reviews_count": host_reviews_count,
+                "host_joined_year": joined_year,
+                "host_years_active": years_active,
+            })
+            
+            processed_ids.add(listing_id)
+            print("✓", flush=True)
+            
+            # Checkpoint tous les BATCH_SIZE
+            if idx % BATCH_SIZE == 0:
+                with open(CHECKPOINT_FILE, 'w') as f:
+                    json.dump({"processed_ids": list(processed_ids)}, f)
+                print(f"  💾 Checkpoint: {len(processed_ids)} traités", flush=True)
+            
+        except Exception as e:
+            print(f"❌ {e}", flush=True)
+        
         time.sleep(DELAY_BETWEEN_DETAIL_CALLS)
+    
+    # Cleanup checkpoint
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+    
+    print(f"\n✅ Phase 2 terminée: {len(processed_ids)} listings enrichis\n", flush=True)
+    
+    # Ajouter host_total_listings_in_dubai pour TOUS
+    for listing in listings_data.values():
+        host_id = listing["host_id"]
+        listing["host_total_listings_in_dubai"] = host_listing_count.get(host_id, 0) if host_id else 0
 
-    # 3) Ajout du nombre de listings par host dans Dubaï
-    for record in details_records:
-        host_id = record.get("host_id")
-        total_for_host = host_listing_count.get(host_id, 0) if host_id else 0
-        record["host_total_listings_in_dubai"] = total_for_host
 
-    # 4) Écriture du CSV final
+def scrape_dubai_to_csv(output_csv_path: str, enable_detailed_enrichment=False, max_details=500):
+    """
+    Scraping complet avec 2 phases:
+    - Phase 1: Récupère tous les listings avec infos basiques (RAPIDE)
+    - Phase 2: Enrichit un échantillon avec get_details (OPTIONNEL, LENT)
+    
+    Args:
+        output_csv_path: Chemin du CSV de sortie
+        enable_detailed_enrichment: Si True, exécute Phase 2 (lent!)
+        max_details: Nombre max d'appels get_details en Phase 2
+    """
+    start_time = time.time()
+    
+    # Phase 1: Collecte rapide
+    listings_data = collect_listings_with_basic_info()
+    
+    # Phase 2: Enrichissement optionnel
+    if enable_detailed_enrichment:
+        enrich_with_detailed_info(listings_data, max_details_calls=max_details)
+    else:
+        print("⏩ Phase 2 désactivée (enable_detailed_enrichment=False)")
+        print("   Pas d'appels get_details = BEAUCOUP plus rapide!")
+        print("   Tu auras: listing_id, title, host_id, host_name, is_superhost\n")
+        
+        # Compter quand même les listings par host
+        host_listing_count = {}
+        for listing in listings_data.values():
+            host_id = listing["host_id"]
+            if host_id:
+                host_listing_count[host_id] = host_listing_count.get(host_id, 0) + 1
+        
+        for listing in listings_data.values():
+            host_id = listing["host_id"]
+            listing["host_total_listings_in_dubai"] = host_listing_count.get(host_id, 0) if host_id else 0
+    
+    # Écriture CSV
+    print(f"💾 Écriture du CSV: {output_csv_path}...", end=" ", flush=True)
+    
     fieldnames = [
         "listing_id",
         "listing_url",
@@ -317,21 +404,79 @@ def scrape_dubai_to_csv(output_csv_path: str):
         "host_id",
         "host_name",
         "host_profile_url",
+        "is_superhost",
         "host_rating",
         "host_reviews_count",
         "host_joined_year",
         "host_years_active",
         "host_total_listings_in_dubai",
     ]
-
+    
+    records = []
+    for listing in listings_data.values():
+        listing_id = listing["listing_id"]
+        
+        dtcm_link = ""
+        if listing["license_code"]:
+            dtcm_link = f"https://hhpermits.det.gov.ae/holidayhomes/Customization/DTCM/CustomPages/HHQRCode.aspx?r={listing['license_code']}"
+        
+        host_profile_url = ""
+        if listing["host_id"]:
+            host_profile_url = f"https://www.airbnb.com/users/show/{listing['host_id']}"
+        
+        records.append({
+            "listing_id": listing_id,
+            "listing_url": f"https://www.airbnb.com/rooms/{listing_id}",
+            "listing_title": listing["listing_title"],
+            "license_code": listing["license_code"],
+            "dtcm_link": dtcm_link,
+            "host_id": listing["host_id"],
+            "host_name": listing["host_name"],
+            "host_profile_url": host_profile_url,
+            "is_superhost": listing["is_superhost"],
+            "host_rating": listing["host_rating"],
+            "host_reviews_count": listing["host_reviews_count"],
+            "host_joined_year": listing["host_joined_year"],
+            "host_years_active": listing["host_years_active"],
+            "host_total_listings_in_dubai": listing["host_total_listings_in_dubai"],
+        })
+    
     with open(output_csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for record in details_records:
-            writer.writerow(record)
-
-    print(f"CSV final écrit dans: {output_csv_path}", flush=True)
+        writer.writerows(records)
+    
+    print("✓", flush=True)
+    
+    elapsed = time.time() - start_time
+    print(f"\n🎉 Scraping terminé en {elapsed/60:.1f} minutes")
+    print(f"📊 {len(records)} listings sauvegardés dans {output_csv_path}")
+    
+    # Stats
+    hosts_with_multiple = sum(1 for r in records if r["host_total_listings_in_dubai"] >= 2)
+    superhosts = sum(1 for r in records if r["is_superhost"])
+    with_license = sum(1 for r in records if r["license_code"])
+    
+    print(f"\n📈 Statistiques:")
+    print(f"   • Hosts avec 2+ listings: {hosts_with_multiple} ({hosts_with_multiple/len(records)*100:.1f}%)")
+    print(f"   • Superhosts: {superhosts} ({superhosts/len(records)*100:.1f}%)")
+    if enable_detailed_enrichment:
+        print(f"   • Avec license DTCM: {with_license} ({with_license/max_details*100:.1f}% de l'échantillon enrichi)")
 
 
 if __name__ == "__main__":
-    scrape_dubai_to_csv("dubai_listings.csv")
+    # MODE RAPIDE (recommandé pour GitHub Actions): Seulement Phase 1
+    # Temps estimé: 5-15 minutes pour tout Dubai
+    scrape_dubai_to_csv(
+        "dubai_listings.csv",
+        enable_detailed_enrichment=False  # Désactivé = RAPIDE
+    )
+    
+    # MODE COMPLET (pour exécution locale avec plus de temps):
+    # Décommenter ci-dessous pour enrichir 500 listings avec licenses
+    # Temps estimé: 10-20 minutes Phase 1 + 5-10 minutes Phase 2
+    # scrape_dubai_to_csv(
+    #     "dubai_listings_detailed.csv",
+    #     enable_detailed_enrichment=True,
+    #     max_details=500  # Limite à 500 pour rester sous 6h GitHub Actions
+    # )
