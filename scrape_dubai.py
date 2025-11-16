@@ -11,7 +11,7 @@ import pyairbnb
 # ==========================
 # ⚙️ CONTRÔLE DU RUN - CHANGE CE NOMBRE SELON TON BESOIN
 # ==========================
-LISTINGS_PER_RUN = 200  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999 pour tout
+LISTINGS_PER_RUN = 50  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999 pour tout
 
 
 # ==========================
