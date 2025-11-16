@@ -1,29 +1,24 @@
 import os
 import csv
-import time
-from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from pyairbnb import pyairbnb
+from datetime import datetime
+from time import sleep
 
-import pyairbnb
+# -----------------------------
+# Paramètres du scraping
+# -----------------------------
+NE_LAT = 25.2853
+NE_LONG = 55.3657
+SW_LAT = 24.8509
+SW_LONG = 54.9674
+CHECKIN = "2025-12-01"
+CHECKOUT = "2025-12-05"
+LISTINGS_LIMIT = 50  # Nombre d'annonces à scraper pour test
+CSV_PATH = "dubai_listings.csv"
+PAUSE_BETWEEN_REQUESTS = 1  # en secondes
 
-# ========================
-# Configuration utilisateur
-# ========================
-LISTINGS_PER_RUN = int(os.getenv("LISTINGS_PER_RUN", "50"))
-CHECK_IN_DAYS_AHEAD = int(os.getenv("CHECK_IN_DAYS_AHEAD", "14"))
-STAY_NIGHTS = int(os.getenv("STAY_NIGHTS", "5"))
-
-CSV_PATH = "dubai_hosts.csv"
-DUBAI_BBOX = {
-    "lat_min": 24.85,
-    "lat_max": 25.35,
-    "lon_min": 54.95,
-    "lon_max": 55.45,
-}
-GRID_ROWS = 3
-GRID_COLS = 4
-
-CSV_COLUMNS = [
+# Champs à extraire
+CSV_FIELDS = [
     "room_id",
     "listing_url",
     "listing_title",
@@ -35,134 +30,90 @@ CSV_COLUMNS = [
     "host_reviews_count",
     "host_joined_year",
     "host_years_active",
-    "host_total_listings_in_dubai",
+    "host_total_listings_in_dubai"
 ]
 
-# ========================
-# Outils internes
-# ========================
+# -----------------------------
+# Chargement des IDs déjà scrappés
+# -----------------------------
+def load_existing_ids(csv_path):
+    if not os.path.exists(csv_path):
+        return set()
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        return {row['room_id'] for row in csv.DictReader(f)}
 
-def safe_get(obj: Any, path: str, default: Any = "") -> Any:
+# -----------------------------
+# Scraping principal
+# -----------------------------
+def scrape_dubai_airbnb():
+    client = pyairbnb.PyAirbnb()
+    existing_ids = load_existing_ids(CSV_PATH)
+    all_results = []
+
+    print("🔍 Recherche d’annonces sur Airbnb Dubaï…")
+
     try:
-        for key in path.split("."):
-            if isinstance(obj, dict):
-                obj = obj.get(key, default)
-            else:
-                return default
-        return obj
-    except Exception:
-        return default
-
-def log(msg: str):
-    print(msg, flush=True)
-
-def ensure_csv_header():
-    if not os.path.exists(CSV_PATH):
-        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-            writer.writeheader()
-
-def read_existing_ids() -> set:
-    existing = set()
-    if not os.path.exists(CSV_PATH):
-        return existing
-    with open(CSV_PATH, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("room_id"):
-                existing.add(row["room_id"])
-    return existing
-
-def build_zones() -> List[Dict[str, float]]:
-    zones = []
-    lat_step = (DUBAI_BBOX["lat_max"] - DUBAI_BBOX["lat_min"]) / GRID_ROWS
-    lon_step = (DUBAI_BBOX["lon_max"] - DUBAI_BBOX["lon_min"]) / GRID_COLS
-    for i in range(GRID_ROWS):
-        for j in range(GRID_COLS):
-            zones.append({
-                "sw": {
-                    "latitude": DUBAI_BBOX["lat_min"] + i * lat_step,
-                    "longitude": DUBAI_BBOX["lon_min"] + j * lon_step,
-                },
-                "ne": {
-                    "latitude": DUBAI_BBOX["lat_min"] + (i + 1) * lat_step,
-                    "longitude": DUBAI_BBOX["lon_min"] + (j + 1) * lon_step,
-                }
-            })
-    return zones
-
-# ========================
-# Phase unique: Recherche + Détails limités
-# ========================
-
-def scrape_dubai_listings():
-    today = datetime.utcnow().date()
-    checkin = (today + timedelta(days=CHECK_IN_DAYS_AHEAD)).isoformat()
-    checkout = (today + timedelta(days=CHECK_IN_DAYS_AHEAD + STAY_NIGHTS)).isoformat()
-    zones = build_zones()
-    collected = []
-    existing_ids = read_existing_ids()
-
-    log("📦 Démarrage du scraping de Dubaï...")
-    ensure_csv_header()
-
-    for zone in zones:
-        try:
-            results = pyairbnb.search_all(
-                check_in=checkin,
-                check_out=checkout,
-                map_bounds={"ne": zone["ne"], "sw": zone["sw"]},
-                refinement_paths=["/homes"],
-                selected_tab_id="home_tab",
-                search_type="PAGINATION",
-                proxy_url=""
-            )
-        except Exception as e:
-            log(f"⚠️ Erreur de recherche zone: {e}")
-            continue
-
-        for item in results:
-            room_id = str(item.get("id"))
-            if room_id in existing_ids:
-                continue
-
-            try:
-                details = pyairbnb.get_details(room_id=room_id)
-                listing = safe_get(details, "listing", {})
-                host = safe_get(listing, "primaryHost", {})
-
-                row = {
-                    "room_id": room_id,
-                    "listing_url": f"https://www.airbnb.com/rooms/{room_id}",
-                    "listing_title": safe_get(listing, "name"),
-                    "license_code": safe_get(listing, "license"),
-                    "host_id": safe_get(host, "id"),
-                    "host_name": safe_get(host, "hostName") or safe_get(host, "name"),
-                    "host_profile_url": f"https://www.airbnb.com/users/show/{safe_get(host, 'id')}",
-                    "host_rating": safe_get(host, "profileRating"),
-                    "host_reviews_count": safe_get(host, "reviewCount"),
-                    "host_joined_year": safe_get(host, "createdAt", "")[:4],
-                    "host_years_active": str(datetime.utcnow().year - int(safe_get(host, "createdAt", "2000")[:4])),
-                    "host_total_listings_in_dubai": safe_get(host, "listingCount"),
-                }
-                collected.append(row)
-                if len(collected) >= LISTINGS_PER_RUN:
-                    break
-            except Exception as e:
-                log(f"   ⚠️ Erreur sur room_id={room_id}: {e}")
-        if len(collected) >= LISTINGS_PER_RUN:
-            break
-
-    if not collected:
-        log("❌ Aucun listing nouveau collecté.")
+        listings = client.search_all(
+            check_in=CHECKIN,
+            check_out=CHECKOUT,
+            ne_lat=NE_LAT,
+            ne_long=NE_LONG,
+            sw_lat=SW_LAT,
+            sw_long=SW_LONG
+        )
+    except Exception as e:
+        print(f"❌ Erreur lors du search_all(): {e}")
         return
 
-    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        for row in collected:
-            writer.writerow(row)
+    count = 0
+    for listing in listings:
+        room_id = str(listing.get("id", ""))
+        if room_id in existing_ids:
+            continue
 
-    log(f"✅ {len(collected)} nouveaux listings ajoutés dans {CSV_PATH}.")
+        try:
+            detail = client.get_details(listing_id=room_id)
+            host = detail.get("host", {})
+            metadata = {
+                "room_id": room_id,
+                "listing_url": f"https://www.airbnb.com/rooms/{room_id}",
+                "listing_title": detail.get("name", ""),
+                "license_code": detail.get("license", "") or detail.get("listing_license", ""),
+                "host_id": str(host.get("id", "")),
+                "host_name": host.get("name", ""),
+                "host_profile_url": host.get("host_url", ""),
+                "host_rating": host.get("host_rating", ""),
+                "host_reviews_count": host.get("host_review_count", ""),
+                "host_joined_year": host.get("host_since", "")[:4] if host.get("host_since") else "",
+                "host_years_active": str(datetime.now().year - int(host.get("host_since", "")[:4])) if host.get("host_since") else "",
+                "host_total_listings_in_dubai": host.get("total_listings_count", "")
+            }
 
+            all_results.append(metadata)
+            count += 1
+            print(f"✅ {count}. {metadata['listing_title']} (ID: {room_id})")
+
+            if count >= LISTINGS_LIMIT:
+                break
+
+            sleep(PAUSE_BETWEEN_REQUESTS)
+        except Exception as e:
+            print(f"⚠️ Erreur sur l'annonce {room_id}: {e}")
+            continue
+
+    if all_results:
+        file_exists = os.path.exists(CSV_PATH)
+        with open(CSV_PATH, "a", newline='', encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=CSV_FIELDS)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(all_results)
+        print(f"\n📁 Données sauvegardées dans {CSV_PATH}")
+    else:
+        print("❗ Aucune nouvelle donnée à ajouter.")
+
+# -----------------------------
+# Lancement
+# -----------------------------
 if __name__ == "__main__":
-    scrape_dubai_listings()
+    scrape_dubai_airbnb()
