@@ -1,115 +1,94 @@
-# ✅ Version corrigée de ton script
-# • Fonctionne avec pyairbnb==2.1.1
-# • Ne fait aucune hypothèse
-# • Respecte ta demande stricte (listing + host + license)
+# scrape_dubai.py
 
-import os
+from pyairbnb import Client
 import csv
-from datetime import datetime, timedelta
-from pyairbnb import search_all, get_details, get_nested_value
+import time
 
-LISTINGS_LIMIT = int(os.getenv("LISTINGS_LIMIT", 50))
-CSV_FILE = "dubai_listings.csv"
+def search_dubai_listings():
+    client = Client()
+    all_results = []
+    max_pages = 3  # Limite pour éviter les surcharges
+    current_page = 0
 
-DUBAI_BOUNDS = {
-    "sw": {"latitude": 24.85, "longitude": 54.95},
-    "ne": {"latitude": 25.35, "longitude": 55.45}
-}
+    while current_page < max_pages:
+        response = client.search_all(
+            location="Dubai, United Arab Emirates",
+            items_per_grid=50,
+            min_bathrooms=1,
+            min_bedrooms=1,
+            min_price=300,
+            max_price=3000,
+            allow_flexible_dates=False,
+            items_per_page=50,  # ← paramètre valide
+            source="structured_search_input_header"
+        )
 
-CSV_COLUMNS = [
-    "room_id",
-    "listing_url",
-    "listing_title",
-    "license_code",
-    "host_id",
-    "host_name",
-    "host_profile_url",
-    "host_rating",
-    "host_reviews_count",
-    "host_joined_year",
-    "host_years_active",
-    "host_total_listings_in_dubai",
-    "scraped_at"
-]
+        if not response or "results" not in response:
+            print("❌ Aucun résultat reçu ou structure inattendue.")
+            break
 
-def log(msg):
-    print(msg, flush=True)
+        all_results.extend(response["results"])
+        print(f"✔️ Page {current_page + 1} : {len(response['results'])} annonces récupérées.")
 
-def extract_listing_fields(item):
-    rid = str(item.get("id"))
-    if not rid:
-        return None
+        if not response.get("has_next_page", False):
+            break
 
-    details = get_details(room_id=rid, language="en")
+        current_page += 1
+        time.sleep(2)  # Petite pause pour éviter de spammer l’API
 
-    host = get_nested_value(details, "listing.primaryHost", {})
-    host_since = host.get("createdAt") or ""
-    joined_year = ""
-    years_active = ""
-    if host_since:
-        try:
-            joined_year = datetime.strptime(host_since, "%Y-%m-%d").year
-            years_active = datetime.utcnow().year - joined_year
-        except:
-            pass
+    return all_results
 
-    return {
-        "room_id": rid,
-        "listing_url": f"https://www.airbnb.com/rooms/{rid}",
-        "listing_title": get_nested_value(details, "listing.name", ""),
-        "license_code": get_nested_value(details, "listing.license", "") or get_nested_value(details, "listing.listing_license", ""),
-        "host_id": host.get("id", ""),
-        "host_name": host.get("hostName", "") or host.get("name", ""),
-        "host_profile_url": f"https://www.airbnb.com/users/show/{host.get('id', '')}",
-        "host_rating": host.get("avgRating", ""),
-        "host_reviews_count": host.get("reviewsCount", ""),
-        "host_joined_year": joined_year,
-        "host_years_active": years_active,
-        "host_total_listings_in_dubai": host.get("listingCount", ""),
-        "scraped_at": datetime.utcnow().isoformat()
-    }
+def extract_listing_info(listings):
+    extracted = []
 
-def save_csv(rows):
-    new_file = not os.path.exists(CSV_FILE)
-    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        if new_file:
-            writer.writeheader()
-        writer.writerows(rows)
+    for listing in listings:
+        data = listing.get("listing", {})
+        host = listing.get("listing", {}).get("primary_host", {})
+
+        extracted.append({
+            "id": data.get("id"),
+            "name": data.get("name"),
+            "property_type": data.get("property_type"),
+            "room_type": data.get("room_type_category"),
+            "bedrooms": data.get("bedrooms"),
+            "bathrooms": data.get("bathrooms"),
+            "price_per_night": listing.get("pricing_quote", {}).get("rate", {}).get("amount"),
+            "monthly_price_factor": listing.get("pricing_quote", {}).get("monthly_price_factor"),
+            "weekly_price_factor": listing.get("pricing_quote", {}).get("weekly_price_factor"),
+            "is_superhost": host.get("is_superhost"),
+            "license_code": data.get("license"),
+            "latitude": data.get("lat"),
+            "longitude": data.get("lng"),
+            "reviews_count": data.get("reviews_count"),
+            "star_rating": data.get("star_rating"),
+            "city": data.get("city"),
+            "neighborhood": data.get("localized_neighborhood"),
+        })
+
+    return extracted
+
+def save_to_csv(data, filename="dubai_airbnb_listings.csv"):
+    if not data:
+        print("❌ Aucune donnée à enregistrer.")
+        return
+
+    with open(filename, mode="w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=data[0].keys())
+        writer.writeheader()
+        writer.writerows(data)
+
+    print(f"✅ Données enregistrées dans : {filename}")
 
 def main():
-    log("--- Phase 1: Recherche des annonces ---")
-    today = datetime.utcnow().date()
-    checkin = today + timedelta(days=14)
-    checkout = checkin + timedelta(days=5)
+    print("--- Phase 1 : Recherche des annonces ---")
+    results = search_dubai_listings()
+    print(f"Total d'annonces trouvées : {len(results)}")
 
-    results = search_all(
-        check_in=checkin.isoformat(),
-        check_out=checkout.isoformat(),
-        items_offset=0,
-        items_per_grid=LISTINGS_LIMIT,
-        map_bounds=DUBAI_BOUNDS,
-        refinement_paths=["/homes"],
-        selected_tab_id="home_tab",
-        search_type="PAGINATION"
-    )
+    print("--- Phase 2 : Extraction des données ---")
+    listings_data = extract_listing_info(results)
 
-    log(f"\n--- Phase 2: Détail de chaque annonce ---")
-    listings = []
-    for idx, item in enumerate(results[:LISTINGS_LIMIT], start=1):
-        try:
-            log(f"[{idx}] Récupération room_id={item.get('id')} ...")
-            row = extract_listing_fields(item)
-            if row:
-                listings.append(row)
-        except Exception as e:
-            log(f"   ⚠️ Erreur room_id={item.get('id')}: {e}")
-
-    if listings:
-        save_csv(listings)
-        log(f"\n✅ {len(listings)} listings enregistrés dans {CSV_FILE}")
-    else:
-        log("❌ Aucune donnée enregistrée.")
+    print("--- Phase 3 : Export CSV ---")
+    save_to_csv(listings_data)
 
 if __name__ == "__main__":
     main()
