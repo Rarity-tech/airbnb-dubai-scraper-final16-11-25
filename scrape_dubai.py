@@ -24,9 +24,10 @@ CHECK_OUT = (future_date + timedelta(days=5)).strftime("%Y-%m-%d")
 CURRENCY = "AED"
 LANGUAGE = "en"
 PROXY_URL = ""
-ZOOM_VALUE = 3
+ZOOM_VALUE = 4  # Plus précis pour cibler Dubai uniquement
 
-DELAY_BETWEEN_DETAILS = 0.5  # Délai entre appels get_details
+DELAY_BETWEEN_DETAILS = 1.0  # Délai entre appels get_details
+DELAY_BETWEEN_HOSTS = 1.5    # Délai entre appels get_host_details
 DELAY_BETWEEN_ZONES = 2.0
 COMMIT_EVERY = 50  # Commit Git tous les 50 listings
 
@@ -49,6 +50,7 @@ def retry_on_failure(max_retries=3, delay=2):
                     return func(*args, **kwargs)
                 except Exception as e:
                     if attempt == max_retries - 1:
+                        print(f"❌ Échec final après {max_retries} tentatives: {e}", flush=True)
                         raise
                     wait_time = delay * (2 ** attempt)
                     print(f"⚠️ Tentative {attempt + 1}/{max_retries} échouée: {e}. Retry dans {wait_time}s", flush=True)
@@ -58,12 +60,16 @@ def retry_on_failure(max_retries=3, delay=2):
     return decorator
 
 
-def build_dubai_subzones(rows=3, cols=4):
-    """Divise Dubai en sous-zones"""
-    north = 25.3585607
-    south = 24.7921359
-    east = 55.5650393
-    west = 54.8904543
+def build_dubai_city_subzones(rows=4, cols=5):
+    """
+    Divise DUBAI VILLE en sous-zones précises
+    Coordonnées resserrées pour éviter Abu Dhabi et autres émirats
+    """
+    # Coordonnées PRÉCISES de Dubai ville uniquement
+    north = 25.3463   # Dubai Marina / Palm Jumeirah (limite nord)
+    south = 24.7743   # Dubai Creek / Al Nahda (limite sud)
+    east = 55.5224    # International City / Dragon Mart (limite est)
+    west = 54.9493    # JBR / The Walk (limite ouest)
 
     lat_step = (north - south) / rows
     lng_step = (east - west) / cols
@@ -77,12 +83,16 @@ def build_dubai_subzones(rows=3, cols=4):
             z_ne_lng = z_sw_lng + lng_step
             
             zones.append({
-                "name": f"zone_{r+1}_{c+1}",
+                "name": f"dubai_{r+1}_{c+1}",
                 "ne_lat": z_ne_lat,
                 "ne_long": z_ne_lng,
                 "sw_lat": z_sw_lat,
                 "sw_long": z_sw_lng,
             })
+    
+    print(f"📍 Zones créées pour DUBAI VILLE uniquement (4x5 = 20 zones)", flush=True)
+    print(f"📍 Limites: {south:.4f}°N à {north:.4f}°N, {west:.4f}°E à {east:.4f}°E\n", flush=True)
+    
     return zones
 
 
@@ -98,7 +108,6 @@ def extract_license_code(text):
     pattern = r'\b[A-Z]{3}-[A-Z]{3}-[A-Z0-9]{5,6}\b'
     matches = re.findall(pattern, str(text))
     
-    # Retourner le premier match trouvé
     return matches[0] if matches else ""
 
 
@@ -113,7 +122,7 @@ def git_commit_and_push(message):
         print(f"✅ Git commit: {message}", flush=True)
         return True
     except subprocess.CalledProcessError as e:
-        print(f"⚠️ Git commit échoué: {e}", flush=True)
+        print(f"⚠️ Git commit échoué (normal si rien à commiter): {e}", flush=True)
         return False
 
 
@@ -168,11 +177,11 @@ def search_zone_with_retry(zone):
 
 
 def collect_all_room_ids():
-    """Phase 1: Récupère tous les room_ids de Dubai"""
-    zones = build_dubai_subzones(rows=3, cols=4)
+    """Phase 1: Récupère tous les room_ids de Dubai ville uniquement"""
+    zones = build_dubai_city_subzones(rows=4, cols=5)
     all_room_ids = []
     
-    print(f"\n🔍 Phase 1: Recherche des room_ids dans {len(zones)} zones", flush=True)
+    print(f"🔍 Phase 1: Recherche des room_ids dans {len(zones)} zones de DUBAI VILLE", flush=True)
     print(f"📅 Dates: {CHECK_IN} → {CHECK_OUT}\n", flush=True)
 
     for idx, zone in enumerate(zones, start=1):
@@ -180,10 +189,26 @@ def collect_all_room_ids():
 
         try:
             search_results = search_zone_with_retry(zone)
+            
+            if not search_results or len(search_results) == 0:
+                print(f"⚠️ 0 résultats", flush=True)
+                continue
+            
             print(f"✓ {len(search_results)} résultats", flush=True)
             
+            # Extraire room_id avec chemins multiples
             for result in search_results:
-                room_id = result.get("room_id")
+                room_id = None
+                
+                # Chemins possibles pour room_id
+                if isinstance(result, dict):
+                    room_id = (
+                        result.get("room_id") or 
+                        result.get("id") or 
+                        result.get("listing", {}).get("id") or
+                        result.get("listing", {}).get("room_id")
+                    )
+                
                 if room_id:
                     all_room_ids.append(str(room_id))
 
@@ -195,7 +220,7 @@ def collect_all_room_ids():
     
     # Déduplication
     unique_ids = list(set(all_room_ids))
-    print(f"\n✅ Phase 1 terminée: {len(unique_ids)} room_ids uniques trouvés\n", flush=True)
+    print(f"\n✅ Phase 1 terminée: {len(unique_ids)} room_ids uniques trouvés à DUBAI\n", flush=True)
     return unique_ids
 
 
@@ -211,93 +236,203 @@ def get_listing_details(room_id):
     )
 
 
-def extract_listing_data(room_id, details):
-    """Extrait toutes les données nécessaires depuis les détails"""
+@retry_on_failure(max_retries=3, delay=2)
+def get_host_full_details(host_id):
+    """
+    Récupère les détails COMPLETS du host via get_host_details()
+    CETTE fonction est la clé pour avoir toutes les infos du host !
+    """
+    return pyairbnb.get_host_details(
+        host_id=host_id,
+        proxy_url=PROXY_URL,
+    )
+
+
+@retry_on_failure(max_retries=3, delay=1)
+def get_host_listings_count(host_id):
+    """
+    Récupère TOUS les listings d'un host pour compter combien il en a
+    """
+    try:
+        listings = pyairbnb.get_listings_from_user(
+            host_id=host_id,
+            proxy_url=PROXY_URL,
+        )
+        return len(listings) if listings else 0
+    except:
+        return 0
+
+
+def extract_listing_data(room_id, details, host_cache):
+    """
+    Extrait toutes les données nécessaires depuis les détails
+    Utilise get_host_details() pour les infos complètes du host
+    """
     
-    # Listing info
+    # ==================
+    # LISTING INFO
+    # ==================
     listing_title = ""
     description = ""
+    host_id = ""
     
-    # Chemins possibles pour le titre
-    for path in ["pdp_listing_detail.name", "listing.name", "name", "title"]:
+    # Titre du listing - chemins multiples
+    title_paths = [
+        ["pdp_listing_detail", "name"],
+        ["listing", "name"],
+        ["name"],
+        ["title"],
+    ]
+    
+    for path in title_paths:
         try:
-            parts = path.split(".")
             value = details
-            for part in parts:
-                value = value.get(part) if isinstance(value, dict) else None
-                if value is None:
+            for key in path:
+                if isinstance(value, dict):
+                    value = value.get(key)
+                else:
+                    value = None
                     break
-            if value:
+            if value and isinstance(value, str):
                 listing_title = value
                 break
         except:
-            pass
+            continue
     
-    # Chemins possibles pour la description (pour extraire license_code)
-    for path in ["pdp_listing_detail.description", "listing.description", "description"]:
+    # Description - pour extraire license_code
+    desc_paths = [
+        ["pdp_listing_detail", "description"],
+        ["listing", "description"],
+        ["description"],
+    ]
+    
+    for path in desc_paths:
         try:
-            parts = path.split(".")
             value = details
-            for part in parts:
-                value = value.get(part) if isinstance(value, dict) else None
-                if value is None:
+            for key in path:
+                if isinstance(value, dict):
+                    value = value.get(key)
+                else:
+                    value = None
                     break
-            if value:
+            if value and isinstance(value, str):
                 description = value
                 break
         except:
-            pass
+            continue
     
-    # Extraire license code
     license_code = extract_license_code(description)
     
-    # Host info
-    host_id = ""
+    # Host ID - CRITIQUE pour get_host_details()
+    host_id_paths = [
+        ["pdp_listing_detail", "primary_host", "id"],
+        ["primary_host", "id"],
+        ["listing", "primary_host", "id"],
+        ["listing", "user", "id"],
+        ["user", "id"],
+        ["host_id"],
+    ]
+    
+    for path in host_id_paths:
+        try:
+            value = details
+            for key in path:
+                if isinstance(value, dict):
+                    value = value.get(key)
+                else:
+                    value = None
+                    break
+            if value:
+                host_id = str(value)
+                break
+        except:
+            continue
+    
+    # ==================
+    # HOST INFO via get_host_details()
+    # ==================
     host_name = ""
     host_rating = ""
     host_reviews_count = ""
     host_joined_year = ""
     host_years_active = ""
+    host_total_listings = 0
     
-    # Chemins pour host
-    host_paths = [
-        "pdp_listing_detail.primary_host",
-        "primary_host",
-        "listing.primary_host",
-        "listing.user",
-        "user"
-    ]
-    
-    host_data = None
-    for path in host_paths:
-        try:
-            parts = path.split(".")
-            value = details
-            for part in parts:
-                value = value.get(part) if isinstance(value, dict) else None
-                if value is None:
-                    break
-            if value and isinstance(value, dict):
-                host_data = value
-                break
-        except:
-            pass
-    
-    if host_data:
-        host_id = str(host_data.get("id", ""))
-        host_name = host_data.get("first_name") or host_data.get("name") or ""
-        host_rating = host_data.get("overall_rating") or host_data.get("rating") or ""
-        host_reviews_count = host_data.get("review_count") or host_data.get("reviews_count") or ""
-        
-        # Année d'inscription
-        member_since = host_data.get("member_since", "")
-        if isinstance(member_since, str) and len(member_since) >= 4:
+    if host_id:
+        # Utiliser le cache pour éviter les appels répétés
+        if host_id not in host_cache:
+            print(f"    → Récupération infos host {host_id}...", end=" ", flush=True)
             try:
-                joined_year = int(member_since[:4])
-                host_joined_year = joined_year
-                host_years_active = datetime.now().year - joined_year
-            except:
-                pass
+                host_details = get_host_full_details(host_id)
+                
+                if host_details and isinstance(host_details, dict):
+                    # Nom du host
+                    host_name = (
+                        host_details.get("first_name") or
+                        host_details.get("name") or
+                        ""
+                    )
+                    
+                    # Rating du host
+                    host_rating = (
+                        host_details.get("overall_rating") or
+                        host_details.get("rating") or
+                        host_details.get("guest_rating") or
+                        ""
+                    )
+                    
+                    # Nombre de reviews
+                    host_reviews_count = (
+                        host_details.get("review_count") or
+                        host_details.get("reviews_count") or
+                        host_details.get("number_of_reviews") or
+                        ""
+                    )
+                    
+                    # Année d'inscription
+                    member_since = (
+                        host_details.get("member_since") or
+                        host_details.get("created_at") or
+                        ""
+                    )
+                    
+                    if isinstance(member_since, str) and len(member_since) >= 4:
+                        try:
+                            joined_year = int(member_since[:4])
+                            host_joined_year = joined_year
+                            host_years_active = datetime.now().year - joined_year
+                        except:
+                            pass
+                    
+                    # Compter les listings du host
+                    host_total_listings = get_host_listings_count(host_id)
+                    
+                    # Cacher les infos du host
+                    host_cache[host_id] = {
+                        "name": host_name,
+                        "rating": host_rating,
+                        "reviews_count": host_reviews_count,
+                        "joined_year": host_joined_year,
+                        "years_active": host_years_active,
+                        "total_listings": host_total_listings,
+                    }
+                    
+                    print(f"✓ {host_name} ({host_total_listings} listings)", flush=True)
+                    time.sleep(DELAY_BETWEEN_HOSTS)
+                
+            except Exception as e:
+                print(f"❌ {e}", flush=True)
+                host_cache[host_id] = {}
+        else:
+            # Utiliser le cache
+            cached = host_cache[host_id]
+            host_name = cached.get("name", "")
+            host_rating = cached.get("rating", "")
+            host_reviews_count = cached.get("reviews_count", "")
+            host_joined_year = cached.get("joined_year", "")
+            host_years_active = cached.get("years_active", "")
+            host_total_listings = cached.get("total_listings", 0)
+            print(f"    → Cache: {host_name}", flush=True)
     
     return {
         "room_id": room_id,
@@ -311,17 +446,19 @@ def extract_listing_data(room_id, details):
         "host_reviews_count": host_reviews_count,
         "host_joined_year": host_joined_year,
         "host_years_active": host_years_active,
+        "host_total_listings_in_dubai": host_total_listings,
     }
 
 
 def scrape_dubai_incremental():
     """
     Scraping incrémental avec sauvegarde Git progressive
+    Utilise get_host_details() pour infos complètes des hosts
     """
     start_time = time.time()
     
     print("=" * 80)
-    print(f"🚀 SCRAPING DUBAI - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🚀 SCRAPING DUBAI VILLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 80)
     print(f"📊 Configuration: {LISTINGS_PER_RUN} listings ce run")
     print("=" * 80 + "\n")
@@ -330,8 +467,12 @@ def scrape_dubai_incremental():
     processed_ids = load_processed_ids()
     existing_records = load_existing_csv()
     
-    # Phase 1: Récupérer tous les room_ids
+    # Phase 1: Récupérer tous les room_ids de DUBAI
     all_room_ids = collect_all_room_ids()
+    
+    if len(all_room_ids) == 0:
+        print("❌ AUCUN LISTING TROUVÉ ! Vérifier les coordonnées géographiques.\n")
+        return
     
     # Filtrer les IDs déjà traités
     remaining_ids = [rid for rid in all_room_ids if rid not in processed_ids]
@@ -354,25 +495,29 @@ def scrape_dubai_incremental():
     
     new_records = []
     commit_counter = 0
+    host_cache = {}  # Cache pour éviter d'appeler get_host_details() plusieurs fois
     
     for idx, room_id in enumerate(to_process, start=1):
         print(f"[{idx}/{len(to_process)}] 🏠 Listing {room_id}...", end=" ", flush=True)
         
         try:
             details = get_listing_details(room_id)
-            record = extract_listing_data(room_id, details)
+            
+            if not details:
+                print(f"❌ Pas de détails", flush=True)
+                continue
+            
+            record = extract_listing_data(room_id, details, host_cache)
             new_records.append(record)
             save_processed_id(room_id)
             
-            print(f"✓ (license: {record['license_code'] or 'N/A'})", flush=True)
+            print(f"✓ {record['listing_title'][:40]}... (license: {record['license_code'] or 'N/A'})", flush=True)
             
             # Commit Git tous les COMMIT_EVERY listings
             commit_counter += 1
             if commit_counter >= COMMIT_EVERY:
-                # Sauvegarder le CSV mis à jour
                 all_records = existing_records + new_records
                 write_csv(all_records)
-                
                 git_commit_and_push(f"Progress: +{commit_counter} listings (total: {len(all_records)})")
                 commit_counter = 0
             
@@ -381,21 +526,8 @@ def scrape_dubai_incremental():
         
         time.sleep(DELAY_BETWEEN_DETAILS)
     
-    # Calcul host_total_listings_in_dubai
-    print(f"\n📊 Calcul des totaux par host...", flush=True)
-    all_records = existing_records + new_records
-    
-    host_count = {}
-    for record in all_records:
-        host_id = record.get("host_id")
-        if host_id:
-            host_count[host_id] = host_count.get(host_id, 0) + 1
-    
-    for record in all_records:
-        host_id = record.get("host_id")
-        record["host_total_listings_in_dubai"] = host_count.get(host_id, 0) if host_id else 0
-    
     # Écriture CSV finale
+    all_records = existing_records + new_records
     write_csv(all_records)
     
     # Commit final
@@ -410,12 +542,13 @@ def scrape_dubai_incremental():
     print(f"📊 Ce run: +{len(new_records)} listings")
     print(f"📊 Total dans CSV: {len(all_records)} listings")
     print(f"📊 Restants: {len(remaining_ids) - len(to_process)}")
+    print(f"📊 Hosts uniques dans cache: {len(host_cache)}")
     
     if len(remaining_ids) - len(to_process) > 0:
         print(f"\n💡 Pour continuer: relance le workflow")
         print(f"   (ou change LISTINGS_PER_RUN pour aller plus vite)")
     else:
-        print(f"\n✅ SCRAPING COMPLET DE DUBAI!")
+        print(f"\n✅ SCRAPING COMPLET DE DUBAI VILLE!")
     
     print("=" * 80 + "\n")
 
