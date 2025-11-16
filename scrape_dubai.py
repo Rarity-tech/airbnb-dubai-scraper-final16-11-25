@@ -1,18 +1,22 @@
 import csv
-import json
 import os
+import re
+import subprocess
 import time
 from datetime import datetime, timedelta
 from functools import wraps
-
 import pyairbnb
+
+
+# ==========================
+# ⚙️ CONTRÔLE DU RUN - CHANGE CE NOMBRE SELON TON BESOIN
+# ==========================
+LISTINGS_PER_RUN = 200  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999 pour tout
 
 
 # ==========================
 # CONFIG GLOBALE
 # ==========================
-
-# Dates dynamiques (2 semaines dans le futur pour max résultats)
 future_date = datetime.now() + timedelta(days=14)
 CHECK_IN = future_date.strftime("%Y-%m-%d")
 CHECK_OUT = (future_date + timedelta(days=5)).strftime("%Y-%m-%d")
@@ -20,17 +24,15 @@ CHECK_OUT = (future_date + timedelta(days=5)).strftime("%Y-%m-%d")
 CURRENCY = "AED"
 LANGUAGE = "en"
 PROXY_URL = ""
-
-# Zoom recommandé pour grande ville (cf. doc pyairbnb)
 ZOOM_VALUE = 3
 
-# Délais anti-rate-limit
-DELAY_BETWEEN_DETAIL_CALLS = 0.5  # Augmenté à 0.5s pour sécurité
-DELAY_BETWEEN_ZONES = 2.0  # Pause entre zones
+DELAY_BETWEEN_DETAILS = 0.5  # Délai entre appels get_details
+DELAY_BETWEEN_ZONES = 2.0
+COMMIT_EVERY = 50  # Commit Git tous les 50 listings
 
-# Checkpoints
-CHECKPOINT_FILE = "checkpoint_progress.json"
-BATCH_SIZE = 50  # Sauvegarder tous les 50 listings
+# Fichiers de sauvegarde
+CSV_FILE = "dubai_listings.csv"
+PROCESSED_IDS_FILE = "processed_ids.txt"
 
 
 # ==========================
@@ -47,7 +49,6 @@ def retry_on_failure(max_retries=3, delay=2):
                     return func(*args, **kwargs)
                 except Exception as e:
                     if attempt == max_retries - 1:
-                        print(f"❌ Échec définitif après {max_retries} tentatives: {e}", flush=True)
                         raise
                     wait_time = delay * (2 ** attempt)
                     print(f"⚠️ Tentative {attempt + 1}/{max_retries} échouée: {e}. Retry dans {wait_time}s", flush=True)
@@ -57,16 +58,8 @@ def retry_on_failure(max_retries=3, delay=2):
     return decorator
 
 
-def build_dubai_subzones(rows=3, cols=4, overlap_percent=0.1):
-    """
-    Divise Dubai en sous-zones avec overlap pour ne rien manquer.
-    
-    Coordonnées Dubai:
-    north = 25.3585607
-    south = 24.7921359
-    east  = 55.5650393
-    west  = 54.8904543
-    """
+def build_dubai_subzones(rows=3, cols=4):
+    """Divise Dubai en sous-zones"""
     north = 25.3585607
     south = 24.7921359
     east = 55.5650393
@@ -74,18 +67,14 @@ def build_dubai_subzones(rows=3, cols=4, overlap_percent=0.1):
 
     lat_step = (north - south) / rows
     lng_step = (east - west) / cols
-    
-    # Overlap pour sécurité
-    lat_overlap = lat_step * overlap_percent
-    lng_overlap = lng_step * overlap_percent
 
     zones = []
     for r in range(rows):
         for c in range(cols):
-            z_sw_lat = max(south, south + r * lat_step - lat_overlap)
-            z_sw_lng = max(west, west + c * lng_step - lng_overlap)
-            z_ne_lat = min(north, z_sw_lat + lat_step + lat_overlap)
-            z_ne_lng = min(east, z_sw_lng + lng_step + lng_overlap)
+            z_sw_lat = south + r * lat_step
+            z_sw_lng = west + c * lng_step
+            z_ne_lat = z_sw_lat + lat_step
+            z_ne_lng = z_sw_lng + lng_step
             
             zones.append({
                 "name": f"zone_{r+1}_{c+1}",
@@ -97,33 +86,71 @@ def build_dubai_subzones(rows=3, cols=4, overlap_percent=0.1):
     return zones
 
 
-def try_paths(obj, paths, default=""):
-    """Essaie plusieurs chemins possibles dans un JSON"""
-    for p in paths:
-        try:
-            val = pyairbnb.get_nested_value(obj, p, None)
-        except Exception:
-            val = None
-        if val not in (None, "", []):
-            return val
-    return default
+def extract_license_code(text):
+    """
+    Extrait le license code de la description
+    Format: BUS-MAG-42KDF (3 lettres - 3 lettres - code alphanumérique)
+    """
+    if not text:
+        return ""
+    
+    # Pattern: 3 LETTRES - 3 LETTRES - 5-6 CARACTÈRES ALPHANUMÉRIQUES
+    pattern = r'\b[A-Z]{3}-[A-Z]{3}-[A-Z0-9]{5,6}\b'
+    matches = re.findall(pattern, str(text))
+    
+    # Retourner le premier match trouvé
+    return matches[0] if matches else ""
 
 
-def safe_int(value, default=None):
-    """Conversion sécurisée en int"""
+def git_commit_and_push(message):
+    """Commit et push vers GitHub"""
     try:
-        return int(value)
-    except Exception:
-        return default
+        subprocess.run(["git", "config", "user.name", "GitHub Actions"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "actions@github.com"], check=True, capture_output=True)
+        subprocess.run(["git", "add", CSV_FILE, PROCESSED_IDS_FILE], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", message], check=True, capture_output=True)
+        subprocess.run(["git", "push"], check=True, capture_output=True)
+        print(f"✅ Git commit: {message}", flush=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ Git commit échoué: {e}", flush=True)
+        return False
+
+
+def load_processed_ids():
+    """Charge les IDs déjà traités"""
+    if os.path.exists(PROCESSED_IDS_FILE):
+        with open(PROCESSED_IDS_FILE, 'r') as f:
+            ids = set(line.strip() for line in f if line.strip())
+        print(f"📂 {len(ids)} listings déjà traités (chargés depuis {PROCESSED_IDS_FILE})", flush=True)
+        return ids
+    return set()
+
+
+def save_processed_id(room_id):
+    """Sauvegarde un ID comme traité"""
+    with open(PROCESSED_IDS_FILE, 'a') as f:
+        f.write(f"{room_id}\n")
+
+
+def load_existing_csv():
+    """Charge le CSV existant pour append"""
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            existing = list(reader)
+        print(f"📂 {len(existing)} lignes déjà dans {CSV_FILE}", flush=True)
+        return existing
+    return []
 
 
 # ==========================
-# SCRAPING OPTIMISÉ
+# SCRAPING
 # ==========================
 
 @retry_on_failure(max_retries=3, delay=2)
 def search_zone_with_retry(zone):
-    """Recherche dans une zone avec retry automatique"""
+    """Recherche dans une zone avec retry"""
     return pyairbnb.search_all(
         check_in=CHECK_IN,
         check_out=CHECK_OUT,
@@ -140,15 +167,12 @@ def search_zone_with_retry(zone):
     )
 
 
-def collect_listings_with_basic_info():
-    """
-    Phase 1: Récupère tous les listings avec infos basiques host
-    depuis search_all (SANS appeler get_details)
-    """
-    zones = build_dubai_subzones(rows=3, cols=4, overlap_percent=0.1)
-    listings_data = {}  # Clé = listing_id
+def collect_all_room_ids():
+    """Phase 1: Récupère tous les room_ids de Dubai"""
+    zones = build_dubai_subzones(rows=3, cols=4)
+    all_room_ids = []
     
-    print(f"\n🔍 Phase 1: Recherche dans {len(zones)} sous-zones de Dubai", flush=True)
+    print(f"\n🔍 Phase 1: Recherche des room_ids dans {len(zones)} zones", flush=True)
     print(f"📅 Dates: {CHECK_IN} → {CHECK_OUT}\n", flush=True)
 
     for idx, zone in enumerate(zones, start=1):
@@ -156,65 +180,30 @@ def collect_listings_with_basic_info():
 
         try:
             search_results = search_zone_with_retry(zone)
+            print(f"✓ {len(search_results)} résultats", flush=True)
+            
+            for result in search_results:
+                room_id = result.get("room_id")
+                if room_id:
+                    all_room_ids.append(str(room_id))
+
         except Exception as e:
-            print(f"❌ Échec: {e}", flush=True)
-            continue
-
-        # Normaliser en liste
-        if not isinstance(search_results, list):
-            possible_list = pyairbnb.get_nested_value(search_results, "results", [])
-            search_results = possible_list if isinstance(possible_list, list) else []
-
-        print(f"✓ {len(search_results)} résultats", flush=True)
-
-        for item in search_results:
-            listing_id = try_paths(item, ["listing.id", "id"])
-            if not listing_id:
-                continue
-            
-            listing_id = str(listing_id)
-            
-            # Déduplication
-            if listing_id in listings_data:
-                continue
-            
-            # Extraire infos basiques (déjà disponibles dans search_all!)
-            listing_title = try_paths(item, ["listing.name", "listing.title"], "")
-            
-            # HOST INFO - Déjà présent dans search_all
-            host_id = try_paths(item, ["listing.user.id", "user.id"], "")
-            host_name = try_paths(item, ["listing.user.first_name", "user.first_name"], "")
-            is_superhost = try_paths(item, ["listing.user.is_superhost", "user.is_superhost"], False)
-            
-            listings_data[listing_id] = {
-                "listing_id": listing_id,
-                "listing_title": listing_title,
-                "host_id": str(host_id) if host_id else "",
-                "host_name": host_name,
-                "is_superhost": is_superhost,
-                # Ces champs seront remplis en Phase 2 si nécessaire
-                "license_code": "",
-                "host_rating": "",
-                "host_reviews_count": "",
-                "host_joined_year": "",
-                "host_years_active": "",
-            }
-
-        # Pause entre zones pour éviter rate limit
+            print(f"❌ Erreur: {e}", flush=True)
+        
         if idx < len(zones):
             time.sleep(DELAY_BETWEEN_ZONES)
     
-    print(f"\n✅ Phase 1 terminée: {len(listings_data)} listings uniques trouvés\n", flush=True)
-    return listings_data
+    # Déduplication
+    unique_ids = list(set(all_room_ids))
+    print(f"\n✅ Phase 1 terminée: {len(unique_ids)} room_ids uniques trouvés\n", flush=True)
+    return unique_ids
 
 
 @retry_on_failure(max_retries=3, delay=2)
-def get_listing_details_with_retry(listing_id):
-    """Appel get_details avec retry automatique"""
-    rid_int = safe_int(listing_id, listing_id)
-    
+def get_listing_details(room_id):
+    """Récupère les détails complets d'un listing"""
     return pyairbnb.get_details(
-        room_id=rid_int,
+        room_id=room_id,
         currency=CURRENCY,
         proxy_url=PROXY_URL,
         adults=2,
@@ -222,189 +211,225 @@ def get_listing_details_with_retry(listing_id):
     )
 
 
-def enrich_with_detailed_info(listings_data, max_details_calls=500):
-    """
-    Phase 2 (OPTIONNELLE): Enrichit avec get_details pour license + host details
+def extract_listing_data(room_id, details):
+    """Extrait toutes les données nécessaires depuis les détails"""
     
-    Pour Dubai avec 20,000+ listings, appeler get_details sur tous prendrait 3+ heures.
-    On limite à max_details_calls (par défaut 500) pour un échantillon représentatif.
+    # Listing info
+    listing_title = ""
+    description = ""
     
-    Priorisation:
-    1. Hosts avec plusieurs listings (probablement pros)
-    2. Superhosts
-    3. Random sample du reste
-    """
-    print(f"\n🔍 Phase 2: Enrichissement avec détails (max {max_details_calls} appels)\n", flush=True)
-    
-    # Charger checkpoint si existe
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE, 'r') as f:
-            checkpoint = json.load(f)
-        processed_ids = set(checkpoint.get("processed_ids", []))
-        print(f"📂 Checkpoint trouvé: {len(processed_ids)} déjà traités", flush=True)
-    else:
-        processed_ids = set()
-    
-    # Compter listings par host
-    host_listing_count = {}
-    for listing in listings_data.values():
-        host_id = listing["host_id"]
-        if host_id:
-            host_listing_count[host_id] = host_listing_count.get(host_id, 0) + 1
-    
-    # Prioriser les listings à enrichir
-    priority_queue = []
-    
-    # Priorité 1: Hosts avec 2+ listings (probablement pros)
-    for listing in listings_data.values():
-        host_id = listing["host_id"]
-        if host_id and host_listing_count.get(host_id, 0) >= 2:
-            priority_queue.append((3, listing["listing_id"]))  # Score 3
-    
-    # Priorité 2: Superhosts
-    for listing in listings_data.values():
-        if listing["is_superhost"]:
-            priority_queue.append((2, listing["listing_id"]))  # Score 2
-    
-    # Priorité 3: Reste (random)
-    import random
-    remaining = [lid for lid in listings_data.keys() 
-                 if lid not in [x[1] for x in priority_queue]]
-    random.shuffle(remaining)
-    for lid in remaining[:max_details_calls]:
-        priority_queue.append((1, lid))
-    
-    # Trier par priorité (score décroissant)
-    priority_queue.sort(reverse=True, key=lambda x: x[0])
-    
-    # Limiter au max
-    priority_queue = priority_queue[:max_details_calls]
-    to_process = [lid for _, lid in priority_queue if lid not in processed_ids]
-    
-    print(f"📊 À enrichir: {len(to_process)} listings (dont {len([x for x in priority_queue if x[0] == 3])} multi-listing hosts)", flush=True)
-    
-    for idx, listing_id in enumerate(to_process, start=1):
-        print(f"[{idx}/{len(to_process)}] 🔄 Détails pour {listing_id}...", end=" ", flush=True)
-        
+    # Chemins possibles pour le titre
+    for path in ["pdp_listing_detail.name", "listing.name", "name", "title"]:
         try:
-            data = get_listing_details_with_retry(listing_id)
-            
-            # License
-            license_code = try_paths(data, [
-                "pdp_listing_detail.license_number",
-                "pdp_listing_detail.license",
-                "listing.license_number",
-            ], "")
-            
-            # Host details
-            host_rating = try_paths(data, [
-                "pdp_listing_detail.primary_host.overall_rating",
-                "primary_host.overall_rating",
-            ], "")
-            
-            host_reviews_count = try_paths(data, [
-                "pdp_listing_detail.primary_host.review_count",
-                "primary_host.review_count",
-            ], "")
-            
-            member_since = try_paths(data, [
-                "pdp_listing_detail.primary_host.member_since",
-                "primary_host.member_since",
-            ], "")
-            
-            joined_year = ""
-            years_active = ""
-            if isinstance(member_since, str) and len(member_since) >= 4:
-                try:
-                    joined_year_int = int(member_since[:4])
-                    joined_year = joined_year_int
-                    years_active = datetime.now().year - joined_year_int
-                except:
-                    pass
-            
-            # Mise à jour
-            listings_data[listing_id].update({
-                "license_code": license_code,
-                "host_rating": host_rating,
-                "host_reviews_count": host_reviews_count,
-                "host_joined_year": joined_year,
-                "host_years_active": years_active,
-            })
-            
-            processed_ids.add(listing_id)
-            print("✓", flush=True)
-            
-            # Checkpoint tous les BATCH_SIZE
-            if idx % BATCH_SIZE == 0:
-                with open(CHECKPOINT_FILE, 'w') as f:
-                    json.dump({"processed_ids": list(processed_ids)}, f)
-                print(f"  💾 Checkpoint: {len(processed_ids)} traités", flush=True)
-            
-        except Exception as e:
-            print(f"❌ {e}", flush=True)
+            parts = path.split(".")
+            value = details
+            for part in parts:
+                value = value.get(part) if isinstance(value, dict) else None
+                if value is None:
+                    break
+            if value:
+                listing_title = value
+                break
+        except:
+            pass
+    
+    # Chemins possibles pour la description (pour extraire license_code)
+    for path in ["pdp_listing_detail.description", "listing.description", "description"]:
+        try:
+            parts = path.split(".")
+            value = details
+            for part in parts:
+                value = value.get(part) if isinstance(value, dict) else None
+                if value is None:
+                    break
+            if value:
+                description = value
+                break
+        except:
+            pass
+    
+    # Extraire license code
+    license_code = extract_license_code(description)
+    
+    # Host info
+    host_id = ""
+    host_name = ""
+    host_rating = ""
+    host_reviews_count = ""
+    host_joined_year = ""
+    host_years_active = ""
+    
+    # Chemins pour host
+    host_paths = [
+        "pdp_listing_detail.primary_host",
+        "primary_host",
+        "listing.primary_host",
+        "listing.user",
+        "user"
+    ]
+    
+    host_data = None
+    for path in host_paths:
+        try:
+            parts = path.split(".")
+            value = details
+            for part in parts:
+                value = value.get(part) if isinstance(value, dict) else None
+                if value is None:
+                    break
+            if value and isinstance(value, dict):
+                host_data = value
+                break
+        except:
+            pass
+    
+    if host_data:
+        host_id = str(host_data.get("id", ""))
+        host_name = host_data.get("first_name") or host_data.get("name") or ""
+        host_rating = host_data.get("overall_rating") or host_data.get("rating") or ""
+        host_reviews_count = host_data.get("review_count") or host_data.get("reviews_count") or ""
         
-        time.sleep(DELAY_BETWEEN_DETAIL_CALLS)
+        # Année d'inscription
+        member_since = host_data.get("member_since", "")
+        if isinstance(member_since, str) and len(member_since) >= 4:
+            try:
+                joined_year = int(member_since[:4])
+                host_joined_year = joined_year
+                host_years_active = datetime.now().year - joined_year
+            except:
+                pass
     
-    # Cleanup checkpoint
-    if os.path.exists(CHECKPOINT_FILE):
-        os.remove(CHECKPOINT_FILE)
-    
-    print(f"\n✅ Phase 2 terminée: {len(processed_ids)} listings enrichis\n", flush=True)
-    
-    # Ajouter host_total_listings_in_dubai pour TOUS
-    for listing in listings_data.values():
-        host_id = listing["host_id"]
-        listing["host_total_listings_in_dubai"] = host_listing_count.get(host_id, 0) if host_id else 0
+    return {
+        "room_id": room_id,
+        "listing_url": f"https://www.airbnb.com/rooms/{room_id}",
+        "listing_title": listing_title,
+        "license_code": license_code,
+        "host_id": host_id,
+        "host_name": host_name,
+        "host_profile_url": f"https://www.airbnb.com/users/show/{host_id}" if host_id else "",
+        "host_rating": host_rating,
+        "host_reviews_count": host_reviews_count,
+        "host_joined_year": host_joined_year,
+        "host_years_active": host_years_active,
+    }
 
 
-def scrape_dubai_to_csv(output_csv_path: str, enable_detailed_enrichment=False, max_details=500):
+def scrape_dubai_incremental():
     """
-    Scraping complet avec 2 phases:
-    - Phase 1: Récupère tous les listings avec infos basiques (RAPIDE)
-    - Phase 2: Enrichit un échantillon avec get_details (OPTIONNEL, LENT)
-    
-    Args:
-        output_csv_path: Chemin du CSV de sortie
-        enable_detailed_enrichment: Si True, exécute Phase 2 (lent!)
-        max_details: Nombre max d'appels get_details en Phase 2
+    Scraping incrémental avec sauvegarde Git progressive
     """
     start_time = time.time()
     
-    # Phase 1: Collecte rapide
-    listings_data = collect_listings_with_basic_info()
+    print("=" * 80)
+    print(f"🚀 SCRAPING DUBAI - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+    print(f"📊 Configuration: {LISTINGS_PER_RUN} listings ce run")
+    print("=" * 80 + "\n")
     
-    # Phase 2: Enrichissement optionnel
-    if enable_detailed_enrichment:
-        enrich_with_detailed_info(listings_data, max_details_calls=max_details)
+    # Charger l'historique
+    processed_ids = load_processed_ids()
+    existing_records = load_existing_csv()
+    
+    # Phase 1: Récupérer tous les room_ids
+    all_room_ids = collect_all_room_ids()
+    
+    # Filtrer les IDs déjà traités
+    remaining_ids = [rid for rid in all_room_ids if rid not in processed_ids]
+    
+    print(f"📊 Statut:")
+    print(f"   • Total Dubai: {len(all_room_ids)} listings")
+    print(f"   • Déjà traités: {len(processed_ids)}")
+    print(f"   • Restants: {len(remaining_ids)}")
+    print(f"   • Ce run: {min(LISTINGS_PER_RUN, len(remaining_ids))}\n")
+    
+    if len(remaining_ids) == 0:
+        print("✅ TOUS LES LISTINGS SONT DÉJÀ TRAITÉS!")
+        print(f"📊 Total final: {len(processed_ids)} listings dans {CSV_FILE}\n")
+        return
+    
+    # Limiter au nombre demandé
+    to_process = remaining_ids[:LISTINGS_PER_RUN]
+    
+    print(f"🔍 Phase 2: Extraction des détails ({len(to_process)} listings)\n", flush=True)
+    
+    new_records = []
+    commit_counter = 0
+    
+    for idx, room_id in enumerate(to_process, start=1):
+        print(f"[{idx}/{len(to_process)}] 🏠 Listing {room_id}...", end=" ", flush=True)
+        
+        try:
+            details = get_listing_details(room_id)
+            record = extract_listing_data(room_id, details)
+            new_records.append(record)
+            save_processed_id(room_id)
+            
+            print(f"✓ (license: {record['license_code'] or 'N/A'})", flush=True)
+            
+            # Commit Git tous les COMMIT_EVERY listings
+            commit_counter += 1
+            if commit_counter >= COMMIT_EVERY:
+                # Sauvegarder le CSV mis à jour
+                all_records = existing_records + new_records
+                write_csv(all_records)
+                
+                git_commit_and_push(f"Progress: +{commit_counter} listings (total: {len(all_records)})")
+                commit_counter = 0
+            
+        except Exception as e:
+            print(f"❌ Erreur: {e}", flush=True)
+        
+        time.sleep(DELAY_BETWEEN_DETAILS)
+    
+    # Calcul host_total_listings_in_dubai
+    print(f"\n📊 Calcul des totaux par host...", flush=True)
+    all_records = existing_records + new_records
+    
+    host_count = {}
+    for record in all_records:
+        host_id = record.get("host_id")
+        if host_id:
+            host_count[host_id] = host_count.get(host_id, 0) + 1
+    
+    for record in all_records:
+        host_id = record.get("host_id")
+        record["host_total_listings_in_dubai"] = host_count.get(host_id, 0) if host_id else 0
+    
+    # Écriture CSV finale
+    write_csv(all_records)
+    
+    # Commit final
+    if commit_counter > 0 or len(new_records) > 0:
+        git_commit_and_push(f"Completed run: +{len(new_records)} listings (total: {len(all_records)})")
+    
+    # Stats finales
+    elapsed = time.time() - start_time
+    print("\n" + "=" * 80)
+    print(f"🎉 RUN TERMINÉ en {elapsed/60:.1f} minutes")
+    print("=" * 80)
+    print(f"📊 Ce run: +{len(new_records)} listings")
+    print(f"📊 Total dans CSV: {len(all_records)} listings")
+    print(f"📊 Restants: {len(remaining_ids) - len(to_process)}")
+    
+    if len(remaining_ids) - len(to_process) > 0:
+        print(f"\n💡 Pour continuer: relance le workflow")
+        print(f"   (ou change LISTINGS_PER_RUN pour aller plus vite)")
     else:
-        print("⏩ Phase 2 désactivée (enable_detailed_enrichment=False)")
-        print("   Pas d'appels get_details = BEAUCOUP plus rapide!")
-        print("   Tu auras: listing_id, title, host_id, host_name, is_superhost\n")
-        
-        # Compter quand même les listings par host
-        host_listing_count = {}
-        for listing in listings_data.values():
-            host_id = listing["host_id"]
-            if host_id:
-                host_listing_count[host_id] = host_listing_count.get(host_id, 0) + 1
-        
-        for listing in listings_data.values():
-            host_id = listing["host_id"]
-            listing["host_total_listings_in_dubai"] = host_listing_count.get(host_id, 0) if host_id else 0
+        print(f"\n✅ SCRAPING COMPLET DE DUBAI!")
     
-    # Écriture CSV
-    print(f"💾 Écriture du CSV: {output_csv_path}...", end=" ", flush=True)
-    
+    print("=" * 80 + "\n")
+
+
+def write_csv(records):
+    """Écrit tous les records dans le CSV"""
     fieldnames = [
-        "listing_id",
+        "room_id",
         "listing_url",
         "listing_title",
         "license_code",
-        "dtcm_link",
         "host_id",
         "host_name",
         "host_profile_url",
-        "is_superhost",
         "host_rating",
         "host_reviews_count",
         "host_joined_year",
@@ -412,71 +437,11 @@ def scrape_dubai_to_csv(output_csv_path: str, enable_detailed_enrichment=False, 
         "host_total_listings_in_dubai",
     ]
     
-    records = []
-    for listing in listings_data.values():
-        listing_id = listing["listing_id"]
-        
-        dtcm_link = ""
-        if listing["license_code"]:
-            dtcm_link = f"https://hhpermits.det.gov.ae/holidayhomes/Customization/DTCM/CustomPages/HHQRCode.aspx?r={listing['license_code']}"
-        
-        host_profile_url = ""
-        if listing["host_id"]:
-            host_profile_url = f"https://www.airbnb.com/users/show/{listing['host_id']}"
-        
-        records.append({
-            "listing_id": listing_id,
-            "listing_url": f"https://www.airbnb.com/rooms/{listing_id}",
-            "listing_title": listing["listing_title"],
-            "license_code": listing["license_code"],
-            "dtcm_link": dtcm_link,
-            "host_id": listing["host_id"],
-            "host_name": listing["host_name"],
-            "host_profile_url": host_profile_url,
-            "is_superhost": listing["is_superhost"],
-            "host_rating": listing["host_rating"],
-            "host_reviews_count": listing["host_reviews_count"],
-            "host_joined_year": listing["host_joined_year"],
-            "host_years_active": listing["host_years_active"],
-            "host_total_listings_in_dubai": listing["host_total_listings_in_dubai"],
-        })
-    
-    with open(output_csv_path, "w", newline="", encoding="utf-8") as f:
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(records)
-    
-    print("✓", flush=True)
-    
-    elapsed = time.time() - start_time
-    print(f"\n🎉 Scraping terminé en {elapsed/60:.1f} minutes")
-    print(f"📊 {len(records)} listings sauvegardés dans {output_csv_path}")
-    
-    # Stats
-    hosts_with_multiple = sum(1 for r in records if r["host_total_listings_in_dubai"] >= 2)
-    superhosts = sum(1 for r in records if r["is_superhost"])
-    with_license = sum(1 for r in records if r["license_code"])
-    
-    print(f"\n📈 Statistiques:")
-    print(f"   • Hosts avec 2+ listings: {hosts_with_multiple} ({hosts_with_multiple/len(records)*100:.1f}%)")
-    print(f"   • Superhosts: {superhosts} ({superhosts/len(records)*100:.1f}%)")
-    if enable_detailed_enrichment:
-        print(f"   • Avec license DTCM: {with_license} ({with_license/max_details*100:.1f}% de l'échantillon enrichi)")
 
 
 if __name__ == "__main__":
-    # MODE RAPIDE (recommandé pour GitHub Actions): Seulement Phase 1
-    # Temps estimé: 5-15 minutes pour tout Dubai
-    scrape_dubai_to_csv(
-        "dubai_listings.csv",
-        enable_detailed_enrichment=False  # Désactivé = RAPIDE
-    )
-    
-    # MODE COMPLET (pour exécution locale avec plus de temps):
-    # Décommenter ci-dessous pour enrichir 500 listings avec licenses
-    # Temps estimé: 10-20 minutes Phase 1 + 5-10 minutes Phase 2
-    # scrape_dubai_to_csv(
-    #     "dubai_listings_detailed.csv",
-    #     enable_detailed_enrichment=True,
-    #     max_details=500  # Limite à 500 pour rester sous 6h GitHub Actions
-    # )
+    scrape_dubai_incremental()
