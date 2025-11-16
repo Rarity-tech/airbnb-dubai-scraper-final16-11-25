@@ -127,7 +127,7 @@ def extract_license_code(text):
 
 
 def git_commit_and_push(message):
-    """Commit et push vers GitHub"""
+    """Commit et push vers GitHub (ignore les erreurs de push en read-only)"""
     try:
         subprocess.run(
             ["git", "config", "user.name", "GitHub Actions"],
@@ -160,9 +160,14 @@ def git_commit_and_push(message):
             check=True,
             capture_output=True,
         )
-        subprocess.run(["git", "push"], check=True, capture_output=True)
-        print(f"✅ Git commit: {message}", flush=True)
-        return True
+        try:
+            subprocess.run(["git", "push"], check=True, capture_output=True)
+            print(f"✅ Git commit: {message}", flush=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            # En environnement GitHub Actions avec token read-only
+            print(f"⚠️ Git push échoué (probablement permissions read-only): {e}", flush=True)
+            return False
     except subprocess.CalledProcessError as e:
         print(f"⚠️ Git commit/push échoué: {e}", flush=True)
         return False
@@ -212,6 +217,43 @@ def get_room_id_from_result(result):
     for c in candidates:
         if c not in (None, "", 0):
             return str(c)
+    return None
+
+
+# ==========================
+# DÉTECTION GÉNÉRIQUE DU HOST
+# ==========================
+
+def looks_like_host_dict(d):
+    """Heuristique pour repérer un bloc host dans le JSON brut."""
+    if not isinstance(d, dict):
+        return False
+    keys = {str(k).lower() for k in d.keys()}
+    has_host_word = any("host" in k for k in keys)
+    has_id_or_reviews = any(
+        k in keys
+        for k in ["id", "user_id", "review_count", "reviews_count", "overall_rating", "overallrating"]
+    )
+    return has_host_word and has_id_or_reviews
+
+
+def find_host_block(obj):
+    """
+    Recherche récursive d'un dict qui ressemble à des infos host.
+    On ne dépend pas de chemins exacts.
+    """
+    if isinstance(obj, dict):
+        if looks_like_host_dict(obj):
+            return obj
+        for v in obj.values():
+            found = find_host_block(v)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_host_block(item)
+            if found is not None:
+                return found
     return None
 
 
@@ -331,9 +373,8 @@ def extract_listing_data(room_id, details):
         if lat and lng:
             lat_f = float(lat)
             lng_f = float(lng)
-            # Même bounding box que build_dubai_subzones, un peu de marge
+            # Même bounding box que build_dubai_subzones, petite marge
             if not (24.80 <= lat_f <= 25.40 and 54.90 <= lng_f <= 55.50):
-                # Hors Dubai → on ignore ce listing
                 print(
                     f"   ↳ Ignoré (hors Dubai) lat={lat_f:.4f}, lng={lng_f:.4f}",
                     flush=True,
@@ -370,76 +411,73 @@ def extract_listing_data(room_id, details):
     license_code = extract_license_code(description)
 
     # ---------------------
-    # Host info
+    # Host info (générique)
     # ---------------------
-    host_id = nested(
-        details,
-        [
-            "pdp_listing_detail.primary_host.id",
-            "primary_host.id",
-            "listing.primary_host.id",
-            "listing.user.id",
-            "user.id",
-        ],
-        default="",
+    host_data = (
+        nested(
+            details,
+            [
+                "pdp_listing_detail.primary_host",
+                "primary_host",
+                "listing.primary_host",
+                "listing.user",
+                "user",
+            ],
+            default=None,
+        )
+        if isinstance(details, dict)
+        else None
     )
 
-    host_name = nested(
-        details,
-        [
-            "pdp_listing_detail.primary_host.full_name",
-            "pdp_listing_detail.primary_host.first_name",
-            "primary_host.full_name",
-            "primary_host.first_name",
-            "listing.primary_host.full_name",
-            "listing.primary_host.first_name",
-            "user.first_name",
-            "user.name",
-        ],
-        default="",
-    )
+    if not isinstance(host_data, dict):
+        host_data = find_host_block(details) or {}
 
-    host_rating = nested(
-        details,
-        [
-            "pdp_listing_detail.primary_host.overall_rating",
-            "primary_host.overall_rating",
-            "pdp_listing_detail.primary_host.overall_rating_localized",
-            "primary_host.overall_rating_localized",
-        ],
-        default="",
-    )
-
-    host_reviews_count = nested(
-        details,
-        [
-            "pdp_listing_detail.primary_host.review_count",
-            "primary_host.review_count",
-            "pdp_listing_detail.primary_host.reviews_count",
-            "primary_host.reviews_count",
-        ],
-        default="",
-    )
-
-    member_since = nested(
-        details,
-        [
-            "pdp_listing_detail.primary_host.member_since",
-            "primary_host.member_since",
-        ],
-        default="",
-    )
-
+    host_id = ""
+    host_name = ""
+    host_rating = ""
+    host_reviews_count = ""
     host_joined_year = ""
     host_years_active = ""
 
-    if isinstance(member_since, str) and len(member_since) >= 4:
-        try:
-            joined_year = int(member_since[:4])
-            host_joined_year = joined_year
-            host_years_active = datetime.now().year - joined_year
-        except Exception:
-            pass
+    if isinstance(host_data, dict):
+        host_id = (
+            host_data.get("id")
+            or host_data.get("host_id")
+            or host_data.get("user_id")
+            or ""
+        )
+        host_name = (
+            host_data.get("host_name")
+            or host_data.get("full_name")
+            or host_data.get("first_name")
+            or host_data.get("name")
+            or ""
+        )
+        host_rating = (
+            host_data.get("overall_rating")
+            or host_data.get("overallRating")
+            or host_data.get("overall_rating_localized")
+            or ""
+        )
+        host_reviews_count = (
+            host_data.get("review_count")
+            or host_data.get("reviews_count")
+            or host_data.get("reviewsCount")
+            or ""
+        )
+        member_since = (
+            host_data.get("member_since")
+            or host_data.get("host_since")
+            or ""
+        )
+
+        if isinstance(member_since, str) and len(member_since) >= 4:
+            try:
+                joined_year = int(member_since[:4])
+                host_joined_year = joined_year
+                host_years_active = datetime.now().year - joined_year
+            except Exception:
+                pass
 
     return {
         "room_id": room_id,
@@ -573,7 +611,7 @@ def scrape_dubai_incremental():
         time.sleep(DELAY_BETWEEN_DETAILS)
 
     # Fin de run : recompute host_total_listings_in_dubai globalement
-    print(f"\n📊 Calcul des totaux par host...", flush=True)
+    print("\n📊 Calcul des totaux par host...", flush=True)
     all_records = existing_records + new_records
 
     host_count = {}
