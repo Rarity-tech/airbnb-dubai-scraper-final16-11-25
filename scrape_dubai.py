@@ -48,7 +48,7 @@ def get_api_credentials():
     
     if API_KEY is None:
         try:
-            API_KEY = pyairbnb.get_api_key()
+            API_KEY = pyairbnb.get_api_key(PROXY_URL)
             print(f"✅ API Key récupérée", flush=True)
         except Exception as e:
             print(f"⚠️ Impossible de récupérer l'API key: {e}", flush=True)
