@@ -241,13 +241,13 @@ def extract_listing_data(room_id, details, host_cache):
     description = details.get("description", "")
     license_code = extract_license_code(description)
     
-    # HOST_ID depuis details["host"]["id"] (TROUVÉ DANS LES LOGS !)
+    # HOST_ID depuis details["host"]["id"]
     host_id = ""
     host_data = details.get("host", {})
     if isinstance(host_data, dict):
         host_id = str(host_data.get("id", ""))
     
-    # Données du host
+    # Données du host (valeurs par défaut)
     host_name = ""
     host_rating = ""
     host_reviews_count = ""
@@ -260,62 +260,81 @@ def extract_listing_data(room_id, details, host_cache):
         api_key, cookies = get_api_credentials()
         
         try:
-            # Appeler get_host_details avec TOUS les paramètres requis
-            host_details = pyairbnb.get_host_details(
-                host_id=host_id,
+            # Appeler get_host_details
+            host_details_response = pyairbnb.get_host_details(
                 api_key=api_key,
                 cookies=cookies,
+                host_id=host_id,
                 language=LANGUAGE,
+                proxy_url=PROXY_URL,
             )
             
-            if host_details and isinstance(host_details, dict):
-                host_name = (
-                    host_details.get("first_name") or
-                    host_details.get("name") or
-                    ""
-                )
-                
-                host_rating = (
-                    host_details.get("overall_rating") or
-                    host_details.get("rating") or
-                    ""
-                )
-                
-                host_reviews_count = (
-                    host_details.get("review_count") or
-                    host_details.get("reviews_count") or
-                    ""
-                )
-                
-                member_since = host_details.get("member_since", "")
-                if member_since and len(str(member_since)) >= 4:
-                    try:
-                        joined_year = int(str(member_since)[:4])
-                        host_joined_year = joined_year
-                        host_years_active = datetime.now().year - joined_year
-                    except:
-                        pass
-                
-                # Compter les listings du host
-                try:
-                    host_listings = pyairbnb.get_listings_from_user(
-                        host_id=host_id,
-                        proxy_url=PROXY_URL,
-                    )
-                    host_total_listings = len(host_listings) if host_listings else 0
-                except:
-                    host_total_listings = 0
-                
-                # Cacher
-                host_cache[host_id] = {
-                    "name": host_name,
-                    "rating": host_rating,
-                    "reviews_count": host_reviews_count,
-                    "joined_year": host_joined_year,
-                    "years_active": host_years_active,
-                    "total_listings": host_total_listings,
-                }
-                
+            if host_details_response and isinstance(host_details_response, dict):
+                # Vérifier si erreur API (profil invalide, permission denied, etc.)
+                if "errors" in host_details_response:
+                    print(f"⚠️ Host {host_id}: profil non accessible", flush=True)
+                    host_cache[host_id] = {}
+                else:
+                    # Structure JSON exacte découverte dans les tests
+                    data = host_details_response.get("data", {})
+                    
+                    # Chemin 1: data → node → hostRatingStats → ratingAverage
+                    node = data.get("node", {})
+                    host_rating_stats = node.get("hostRatingStats", {})
+                    host_rating = host_rating_stats.get("ratingAverage", "")
+                    
+                    # Chemin 2: data → presentation → userProfileContainer → userProfile
+                    presentation = data.get("presentation", {})
+                    user_profile_container = presentation.get("userProfileContainer", {})
+                    user_profile = user_profile_container.get("userProfile")
+                    
+                    if user_profile:
+                        # Nom: smartName (comme "Caroline")
+                        host_name = user_profile.get("smartName", "")
+                        if not host_name:
+                            host_name = user_profile.get("displayFirstName", "")
+                        
+                        # Reviews count
+                        reviews_data = user_profile.get("reviewsReceivedFromGuests", {})
+                        host_reviews_count = reviews_data.get("count", "")
+                        
+                        # Date de création et calcul des années
+                        created_at = user_profile.get("createdAt", "")
+                        if created_at:
+                            try:
+                                # Format ISO: "2018-02-22T04:47:06.000Z"
+                                created_date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                                host_joined_year = created_date.year
+                                host_years_active = datetime.now().year - host_joined_year
+                            except Exception as e:
+                                print(f"⚠️ Date parsing error host {host_id}", flush=True)
+                        
+                        # Compter les listings du host
+                        try:
+                            host_listings = pyairbnb.get_listings_from_user(
+                                host_id=host_id,
+                                api_key=api_key,
+                                proxy_url=PROXY_URL,
+                            )
+                            host_total_listings = len(host_listings) if host_listings else 0
+                        except Exception as e:
+                            print(f"⚠️ Erreur listings host {host_id}", flush=True)
+                            host_total_listings = 0
+                        
+                        # Sauvegarder dans le cache
+                        host_cache[host_id] = {
+                            "name": host_name,
+                            "rating": host_rating,
+                            "reviews_count": host_reviews_count,
+                            "joined_year": host_joined_year,
+                            "years_active": host_years_active,
+                            "total_listings": host_total_listings,
+                        }
+                    else:
+                        # Pas de userProfile
+                        print(f"⚠️ Host {host_id}: pas de userProfile", flush=True)
+                        host_cache[host_id] = {}
+                        
         except Exception as e:
             print(f"⚠️ Erreur host {host_id}: {e}", flush=True)
             host_cache[host_id] = {}
