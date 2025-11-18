@@ -11,20 +11,20 @@ import pyairbnb
 # ==========================
 # ⚙️ CONTRÔLE DU RUN
 # ==========================
-LISTINGS_PER_RUN = 50  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999
+LISTINGS_PER_RUN = 2000  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999
 
 
 # ==========================
 # CONFIG GLOBALE
 # ==========================
-future_date = datetime.now() + timedelta(days=14)
+future_date = datetime.now() + timedelta(days=90)
 CHECK_IN = future_date.strftime("%Y-%m-%d")
 CHECK_OUT = (future_date + timedelta(days=5)).strftime("%Y-%m-%d")
 
 CURRENCY = "AED"
 LANGUAGE = "en"
 PROXY_URL = ""
-ZOOM_VALUE = 4
+ZOOM_VALUE = 11
 
 DELAY_BETWEEN_DETAILS = 1.0
 DELAY_BETWEEN_ZONES = 2.0
