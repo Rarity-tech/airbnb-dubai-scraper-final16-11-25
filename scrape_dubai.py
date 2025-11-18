@@ -48,7 +48,7 @@ def get_api_credentials():
     
     if API_KEY is None:
         try:
-            API_KEY = pyairbnb.get_api_key(PROXY_URL)
+            API_KEY = pyairbnb.get_api_key(PROXY_URL)  # ← CORRECTION ICI
             print(f"✅ API Key récupérée", flush=True)
         except Exception as e:
             print(f"⚠️ Impossible de récupérer l'API key: {e}", flush=True)
@@ -106,13 +106,33 @@ def build_dubai_city_subzones(rows=4, cols=5):
 
 
 def extract_license_code(text):
-    """Extrait le license code"""
+    """Extrait le license code depuis la description - capture TOUT après 'Registration Details' jusqu'à virgule"""
     if not text:
         return ""
     
-    pattern = r'\b[A-Z]{3}-[A-Z]{3}-[A-Z0-9]{5,6}\b'
-    matches = re.findall(pattern, str(text))
-    return matches[0] if matches else ""
+    # Convertir en string et nettoyer les balises HTML
+    text_str = str(text)
+    text_clean = re.sub(r'<[^>]+>', ' ', text_str)
+    
+    # Chercher après les mots-clés de registration
+    keywords = [
+        r'Registration\s+Details?',
+        r'Registration\s+(?:Number|No\.?|Code)',
+        r'License\s+(?:Number|No\.?|Code)',
+        r'Permit\s+(?:Number|No\.?)',
+    ]
+    
+    pattern = r'(?:' + '|'.join(keywords) + r')[:\s]*([^,\n]+)'
+    
+    match = re.search(pattern, text_clean, re.IGNORECASE)
+    
+    if match:
+        code = match.group(1).strip()
+        # Nettoyer les espaces multiples
+        code = ' '.join(code.split())
+        return code
+    
+    return ""
 
 
 def git_commit_and_push(message):
