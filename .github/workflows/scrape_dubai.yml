@@ -2,7 +2,10 @@ name: Scrape Dubai Airbnb
 
 on:
   workflow_dispatch:  # lancement manuel depuis l'onglet Actions
-
+  permissions:        # ← AJOUTER CES 3 LIGNES
+  contents: write   # ←
+  # ← 
+  
 jobs:
   scrape:
     runs-on: ubuntu-latest
