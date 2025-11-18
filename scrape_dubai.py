@@ -11,13 +11,13 @@ import pyairbnb
 # ==========================
 # ⚙️ CONTRÔLE DU RUN
 # ==========================
-LISTINGS_PER_RUN = 2000  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999
+LISTINGS_PER_RUN = 3000  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999
 
 
 # ==========================
 # CONFIG GLOBALE
 # ==========================
-future_date = datetime.now() + timedelta(days=90)
+future_date = datetime.now() + timedelta(days=20)
 CHECK_IN = future_date.strftime("%Y-%m-%d")
 CHECK_OUT = (future_date + timedelta(days=5)).strftime("%Y-%m-%d")
 
