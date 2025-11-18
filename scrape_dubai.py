@@ -334,6 +334,8 @@ def extract_listing_data(room_id, details, host_cache):
                             host_listings = pyairbnb.get_listings_from_user(
                                 host_id=host_id,
                                 api_key=api_key,
+                                cookies=cookies,
+                                language=LANGUAGE,
                                 proxy_url=PROXY_URL,
                             )
                             host_total_listings = len(host_listings) if host_listings else 0
