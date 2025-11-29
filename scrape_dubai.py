@@ -24,7 +24,7 @@ CHECK_OUT = (future_date + timedelta(days=5)).strftime("%Y-%m-%d")
 CURRENCY = "AED"
 LANGUAGE = "en"
 PROXY_URL = ""
-ZOOM_VALUE = 11
+ZOOM_VALUE = 12
 
 DELAY_BETWEEN_DETAILS = 1.0
 DELAY_BETWEEN_ZONES = 2.0
