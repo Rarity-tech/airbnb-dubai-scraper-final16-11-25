@@ -17,14 +17,14 @@ LISTINGS_PER_RUN = 3000  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999
 # ==========================
 # CONFIG GLOBALE
 # ==========================
-future_date = datetime.now() + timedelta(days=14)
+future_date = datetime.now() + timedelta(days=10)
 CHECK_IN = future_date.strftime("%Y-%m-%d")
 CHECK_OUT = (future_date + timedelta(days=5)).strftime("%Y-%m-%d")
 
 CURRENCY = "AED"
 LANGUAGE = "en"
 PROXY_URL = ""
-ZOOM_VALUE = 10
+ZOOM_VALUE = 11
 
 DELAY_BETWEEN_DETAILS = 1.0
 DELAY_BETWEEN_ZONES = 2.0
