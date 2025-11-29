@@ -17,7 +17,7 @@ LISTINGS_PER_RUN = 3000  # ← MODIFIE CE NOMBRE: 200, 1000, 5000, ou 999999
 # ==========================
 # CONFIG GLOBALE
 # ==========================
-future_date = datetime.now() + timedelta(days=9)
+future_date = datetime.now() + timedelta(days=10)
 CHECK_IN = future_date.strftime("%Y-%m-%d")
 CHECK_OUT = (future_date + timedelta(days=1)).strftime("%Y-%m-%d")
 
